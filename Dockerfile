@@ -6,10 +6,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
+# Wir kopieren erst den Code, dann install — kein editable mode im Container
+# (jeder Code-Change rebuildet das Image sowieso).
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir -e .
-
 COPY ki_os_mcp/ ./ki_os_mcp/
+RUN pip install --no-cache-dir .
 
 ENV PYTHONUNBUFFERED=1 \
     VAULT_PATH=/vault \
