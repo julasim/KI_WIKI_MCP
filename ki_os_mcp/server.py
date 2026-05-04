@@ -133,6 +133,9 @@ def read_file(path: str) -> dict[str, Any]:
 def list_files(path: str = "") -> dict[str, Any]:
     """Listet Inhalt eines Vault-Folders (nicht rekursiv).
 
+    HINWEIS: Für Tasks lieber `list_tasks` verwenden (filtert by status
+    und sortiert nach Priorität). list_files zeigt ALLE Files inkl. done.
+
     Args:
         path: Rel-Pfad zum Folder, "" für Vault-Root
 
@@ -141,6 +144,111 @@ def list_files(path: str = "") -> dict[str, Any]:
     """
     try:
         return {"path": path, "entries": vault.list_dir(path)}
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def list_tasks(
+    status: str = "open",
+    project: str | None = None,
+    priority: str | None = None,
+    context: str | None = None,
+    overdue_only: bool = False,
+    due_until: str | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """Listet Tasks aus 10_Life/tasks/ mit Filter + sinnvollem Sort.
+
+    DEFAULT: nur offene Tasks (status='open'), sortiert nach Priorität
+    (urgent → high → medium → low) und dann nach Due-Datum.
+
+    Filter sind kombinierbar (alle als AND).
+
+    Args:
+        status: 'open' | 'done' | 'snoozed' | 'all' (default 'open')
+        project: Nur Tasks mit diesem Projekt-Slug (z.B. "dachboden-ausbau")
+        priority: Nur Tasks mit dieser exakten Priority
+        context: Nur Tasks mit diesem Context (z.B. "@home", "@work")
+        overdue_only: Nur Tasks mit due < heute (status egal)
+        due_until: Nur Tasks mit due <= diesem ISO-Datum
+        limit: Max Anzahl Treffer (default 30)
+
+    Returns:
+        {tasks: [{id, title, status, priority, due, project, context, path}],
+         total_matched, total_in_vault}
+    """
+    try:
+        if status not in ("open", "done", "snoozed", "all"):
+            return {"error": f"Ungültiger status: {status} (open|done|snoozed|all)"}
+        tasks_dir = vault.VAULT_PATH / "10_Life" / "tasks"
+        if not tasks_dir.is_dir():
+            return {"tasks": [], "total_matched": 0, "total_in_vault": 0}
+
+        today = vault.today_iso()
+        all_count = 0
+        matched: list[dict[str, Any]] = []
+
+        for path in tasks_dir.glob("*.md"):
+            all_count += 1
+            try:
+                post = vault.read_post(vault.rel_path(path))
+            except Exception:  # noqa: BLE001
+                continue
+            fm = post.metadata
+            t_status = fm.get("status")
+            t_due = fm.get("due")
+            t_priority = fm.get("priority")
+            t_project = fm.get("project")
+            t_context = fm.get("context")
+
+            # Filter
+            if status != "all" and t_status != status:
+                continue
+            if project and t_project != project:
+                continue
+            if priority and t_priority != priority:
+                continue
+            if context and t_context != context:
+                continue
+            if due_until and (not t_due or str(t_due) > due_until):
+                continue
+            if overdue_only:
+                if not t_due or str(t_due) >= today:
+                    continue
+
+            matched.append(
+                {
+                    "id": fm.get("id"),
+                    "title": fm.get("title"),
+                    "status": t_status,
+                    "priority": t_priority,
+                    "due": str(t_due) if t_due else None,
+                    "project": t_project,
+                    "context": t_context,
+                    "recurrence": fm.get("recurrence"),
+                    "path": vault.rel_path(path),
+                }
+            )
+
+        # Sort: overdue first, dann priority, dann due
+        prio_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+
+        def sort_key(t: dict[str, Any]) -> tuple[Any, ...]:
+            due = t.get("due") or "9999-12-31"
+            is_overdue = bool(t.get("due")) and t["due"] < today and t["status"] == "open"
+            return (
+                0 if is_overdue else 1,                     # overdue zuerst
+                prio_order.get(t.get("priority"), 99),      # urgent zuerst
+                due,                                         # früheres due zuerst
+            )
+
+        matched.sort(key=sort_key)
+        return {
+            "tasks": matched[:limit],
+            "total_matched": len(matched),
+            "total_in_vault": all_count,
+        }
     except VaultError as e:
         return {"error": str(e)}
 
