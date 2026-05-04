@@ -127,6 +127,83 @@ def find_task(task_id_or_slug: str) -> Path | None:
     return None
 
 
+# ---------- Wikilinks ---------------------------------------------------------
+
+# [[id]], [[id|display]], [[id#anchor]], [[id#anchor|display]]
+# Capture: 1=id, 2=anchor (mit #), 3=display (mit |)
+_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(\|[^\]]*)?\]\]")
+
+
+def find_wikilink_refs(target_id: str) -> list[tuple[Path, list[int]]]:
+    """Findet alle .md-Files die [[target_id]] enthalten (egal ob mit
+    display-text oder anchor). Returns Liste von (path, [line_nums]).
+    """
+    target = target_id.strip()
+    out: list[tuple[Path, list[int]]] = []
+    for path in walk_md():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        line_nums: list[int] = []
+        for i, line in enumerate(text.split("\n"), 1):
+            for m in _WIKILINK_RE.finditer(line):
+                if m.group(1).strip() == target:
+                    line_nums.append(i)
+                    break
+        if line_nums:
+            out.append((path, line_nums))
+    return out
+
+
+def replace_wikilinks(text: str, old_id: str, new_id: str) -> tuple[str, int]:
+    """Ersetzt alle [[old_id]] / [[old_id|display]] / [[old_id#anchor]] etc.
+    durch new_id, behält display + anchor bei. Returns (new_text, count).
+    """
+    old = old_id.strip()
+    count = 0
+
+    def sub(m: re.Match[str]) -> str:
+        nonlocal count
+        if m.group(1).strip() != old:
+            return m.group(0)
+        count += 1
+        anchor = m.group(2) or ""
+        display = m.group(3) or ""
+        return f"[[{new_id}{anchor}{display}]]"
+
+    return _WIKILINK_RE.sub(sub, text), count
+
+
+def migrate_id_in_related(post: frontmatter.Post, old_id: str, new_id: str) -> bool:
+    """Ersetzt old_id durch new_id in frontmatter `related` Liste.
+    Returns True wenn was geändert wurde."""
+    related = post.metadata.get("related")
+    if not isinstance(related, list):
+        return False
+    new_list = [new_id if r == old_id else r for r in related]
+    if new_list == related:
+        return False
+    post["related"] = new_list
+    return True
+
+
+# ---------- Slug-Constraint ---------------------------------------------------
+
+SLUG_MAX = 60
+
+
+def validate_slug(slug: str) -> str | None:
+    """Returns Fehlertext wenn ungültig, sonst None."""
+    if not slug:
+        return "Leerer slug"
+    if len(slug) > SLUG_MAX:
+        return f"Slug zu lang ({len(slug)} > {SLUG_MAX} Zeichen)"
+    if not re.fullmatch(r"[a-z0-9äöüß\-]+", slug):
+        return f"Slug enthält ungültige Zeichen: {slug!r}"
+    return None
+
+
 # ---------- Listing -----------------------------------------------------------
 
 

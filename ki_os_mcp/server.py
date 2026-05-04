@@ -173,6 +173,9 @@ def create_note(
     """
     try:
         slug = vault.slugify(title)
+        slug_err = vault.validate_slug(slug)
+        if slug_err:
+            return {"error": f"Slug ungültig: {slug_err}"}
         date = vault.today_iso()
         filename = f"{date}_{slug}.md"
         if project:
@@ -215,6 +218,7 @@ def create_task(
     due: str | None = None,
     context: str | None = None,
     body: str = "",
+    recurrence: str | None = None,
 ) -> dict[str, Any]:
     """Erstellt einen neuen Task in 10_Life/tasks/ (gemäß SCHEMA.md).
 
@@ -225,12 +229,13 @@ def create_task(
     ID:    t-<slug> (Schema §7)
 
     Args:
-        title: Task-Titel
+        title: Task-Titel (slug max 60 Zeichen, sonst Error)
         project: Optional Projekt-Slug (kommt nur ins Frontmatter, nicht ins Path)
         priority: urgent | high | medium | low (default medium)
         due: ISO-Datum (YYYY-MM-DD) oder None
         context: Kontext-Tag wie "@home", "@work", "@phone"
         body: Optional Markdown-Body unter Frontmatter
+        recurrence: daily | weekdays | weekly | monthly (Schema §9, optional)
 
     Returns:
         {path, id}
@@ -238,7 +243,12 @@ def create_task(
     try:
         if priority not in ("urgent", "high", "medium", "low"):
             return {"error": f"Ungültige Priorität: {priority}"}
+        if recurrence is not None and recurrence not in ("daily", "weekdays", "weekly", "monthly"):
+            return {"error": f"Ungültige recurrence: {recurrence} (erlaubt: daily|weekdays|weekly|monthly)"}
         slug = vault.slugify(title)
+        slug_err = vault.validate_slug(slug)
+        if slug_err:
+            return {"error": f"Slug ungültig: {slug_err}"}
         task_id = f"t-{slug}"
         rel = f"10_Life/tasks/{slug}.md"
 
@@ -263,6 +273,8 @@ def create_task(
             meta["due"] = due
         if context:
             meta["context"] = context
+        if recurrence:
+            meta["recurrence"] = recurrence
 
         post = frontmatter.Post(body, **meta)
         vault.write_post(rel, post)
@@ -449,6 +461,9 @@ def create_meeting(
             return {"error": "attendees ist Pflicht (Schema §2: meeting)"}
         d = date or vault.today_iso()
         slug = vault.slugify(title)
+        slug_err = vault.validate_slug(slug)
+        if slug_err:
+            return {"error": f"Slug ungültig: {slug_err}"}
         filename = f"{d}_{slug}.md"
         if project:
             rel = f"05_Projects/{project}/meetings/{filename}"
@@ -562,6 +577,257 @@ def confirm_delete(token: str) -> dict[str, Any]:
     except VaultError as e:
         # Bei Fehler Token wieder einsetzen damit Retry möglich ist
         _pending_deletes[token] = pending
+        return {"error": str(e)}
+
+
+# ---------- Move Tool (Wikilink-Migration) -----------------------------------
+
+
+@mcp.tool()
+def move(
+    source: str,
+    dest: str,
+    update_links: bool = True,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Verschiebt/renamed eine Datei und migriert alle Wikilinks im Vault.
+
+    Wenn der Filename (= ID-Slug) sich ändert, werden ALLE [[old-id]],
+    [[old-id|display]], [[old-id#anchor]] Referenzen in allen .md-Files auf
+    die neue ID umgeschrieben. Auch Frontmatter `related: [old-id]` wird
+    migriert. ID im verschobenen File selbst wird auf den neuen Slug gesetzt.
+
+    **Empfehlung:** Erst mit dry_run=True ansehen welche Files betroffen wären.
+
+    Args:
+        source: Rel-Pfad der Quelldatei
+        dest: Rel-Pfad des Ziels (kann anderen Folder + Filename haben)
+        update_links: Wikilinks in anderen Files mit-migrieren (default True)
+        dry_run: Nur Preview, nichts schreiben (default False)
+
+    Returns:
+        {moved: bool, from, to, id_change?: {old, new},
+         wikilinks_updated: [{path, replacements}, ...],
+         (dry_run: true falls nur Preview)}
+    """
+    try:
+        src = vault.safe_path(source)
+        if not src.is_file():
+            return {"error": f"Quelldatei nicht gefunden: {source}"}
+        dst = vault.safe_path(dest)
+        if dst.exists():
+            return {"error": f"Zieldatei existiert bereits: {dest}"}
+        if src == dst:
+            return {"error": "source und dest sind identisch"}
+
+        # ID-Berechnung nur für .md
+        old_id: str | None = None
+        new_id: str | None = None
+        if src.suffix == ".md" and dst.suffix == ".md":
+            old_id = src.stem  # filename ohne .md
+            new_id = dst.stem
+            # Bei Notes mit Datum-Präfix YYYY-MM-DD_<slug> ist die ID nur der Slug-Teil
+            # (Schema §7: note id = slug, Datum nur im Filename).
+            # Heuristik: wenn Stem mit YYYY-MM-DD_ anfängt, strip das.
+            import re as _re
+            date_prefix = _re.compile(r"^\d{4}-\d{2}-\d{2}_")
+            if date_prefix.match(old_id):
+                old_id = date_prefix.sub("", old_id)
+            if date_prefix.match(new_id):
+                new_id = date_prefix.sub("", new_id)
+
+        # Wikilink-Refs sammeln
+        refs: list[tuple[Any, list[int]]] = []
+        if old_id and new_id and old_id != new_id and update_links:
+            refs = vault.find_wikilink_refs(old_id)
+
+        refs_summary = [
+            {"path": vault.rel_path(p), "lines": lines} for p, lines in refs
+        ]
+
+        if dry_run:
+            return {
+                "dry_run": True,
+                "from": source,
+                "to": dest,
+                "id_change": (
+                    {"old": old_id, "new": new_id}
+                    if old_id and new_id and old_id != new_id
+                    else None
+                ),
+                "wikilink_refs": refs_summary,
+                "would_update_files": len(refs_summary),
+            }
+
+        # Echter Move
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.suffix == ".md":
+            post = vault.read_post(source)
+            if old_id and new_id and old_id != new_id:
+                post["id"] = new_id
+            # write_post setzt auch updated
+            vault.write_post(dest, post)
+        else:
+            # Binär: einfach kopieren
+            dst.write_bytes(src.read_bytes())
+
+        # Source löschen
+        src_orig = src
+        src.unlink()
+        # Leere Eltern-Folder aufräumen
+        parent = src_orig.parent
+        while (
+            parent != vault.VAULT_PATH
+            and parent.exists()
+            and not any(parent.iterdir())
+        ):
+            parent.rmdir()
+            parent = parent.parent
+
+        # Wikilink-Updates in anderen Files
+        updated_files: list[dict[str, Any]] = []
+        if old_id and new_id and old_id != new_id and update_links:
+            for path, _lines in refs:
+                # File evtl. = unsere neue Datei (selbstreferenz)? Skip wenn ja.
+                if path == dst:
+                    continue
+                try:
+                    raw = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+                except OSError:
+                    continue
+                # Body-Wikilinks ersetzen
+                new_raw, count = vault.replace_wikilinks(raw, old_id, new_id)
+                # FM `related` migrieren
+                fm_changed = False
+                try:
+                    p2 = frontmatter.loads(new_raw)
+                    if vault.migrate_id_in_related(p2, old_id, new_id):
+                        new_raw = frontmatter.dumps(p2) + "\n"
+                        fm_changed = True
+                except Exception:  # noqa: BLE001
+                    pass
+                if count > 0 or fm_changed:
+                    path.write_text(new_raw, encoding="utf-8")
+                    updated_files.append(
+                        {
+                            "path": vault.rel_path(path),
+                            "wikilink_replacements": count,
+                            "frontmatter_related_updated": fm_changed,
+                        }
+                    )
+
+        return {
+            "moved": True,
+            "from": source,
+            "to": dest,
+            "id_change": (
+                {"old": old_id, "new": new_id}
+                if old_id and new_id and old_id != new_id
+                else None
+            ),
+            "wikilinks_updated": updated_files,
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+# ---------- Goal Log ---------------------------------------------------------
+
+
+@mcp.tool()
+def goal_log(
+    goal: str,
+    text: str,
+    subtype: str = "tracker",
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Hängt einen Eintrag an die Tracker-Datei eines Goal-Systems an.
+
+    Path: 10_Life/goals/<goal>/<subtype>.md
+
+    Args:
+        goal: Goal-Slug (z.B. "5y-2031")
+        text: Markdown-Text (eine Zeile oder mehrere)
+        subtype: Subtype-File-Name (default "tracker"; Schema §8 erlaubt
+            readme|vision|säulen|routinen|vermögensplan|quartal|monat|woche|tracker)
+        date: ISO-Datum als Heading-Präfix (default heute)
+
+    Returns:
+        {path, appended}
+    """
+    try:
+        d = date or vault.today_iso()
+        rel = f"10_Life/goals/{goal}/{subtype}.md"
+        p = vault.safe_path(rel)
+        # File anlegen falls nicht da (mit minimalem Skeleton)
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            skeleton_fm = {
+                "id": f"goal-{goal}-{subtype}",
+                "type": "goal-system",
+                "subtype": subtype,
+                "goal": goal,
+                "title": f"{goal} — {subtype}",
+                "created": vault.today_iso(),
+                "updated": vault.today_iso(),
+                "status": "draft",
+                "tags": ["goal", goal],
+            }
+            import yaml as _yaml
+            skeleton = (
+                "---\n"
+                + _yaml.safe_dump(skeleton_fm, allow_unicode=True, sort_keys=True)
+                + "---\n\n"
+                + f"# {goal} — {subtype}\n\n"
+            )
+            p.write_text(skeleton, encoding="utf-8")
+        # Append
+        existing = p.read_text(encoding="utf-8").replace("\r\n", "\n")
+        appendix = f"\n## {d}\n{text.strip()}\n"
+        p.write_text(existing.rstrip() + appendix, encoding="utf-8")
+        return {"path": rel, "appended": appendix.strip().split("\n")[0]}
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+# ---------- Project Context --------------------------------------------------
+
+
+@mcp.tool()
+def project_context(
+    project: str,
+    text: str,
+    mode: str = "append",
+) -> dict[str, Any]:
+    """Update CONTEXT.md eines Projekts (Bot-spezifischer Projekt-Kontext).
+
+    Path: 05_Projects/<project>/CONTEXT.md
+
+    Args:
+        project: Projekt-Slug
+        text: Neuer Kontext-Text (Markdown)
+        mode: "append" (anhängen mit Datum-Header) oder "replace" (Body komplett ersetzen)
+
+    Returns:
+        {path, mode}
+    """
+    try:
+        if mode not in ("append", "replace"):
+            return {"error": f"mode muss 'append' oder 'replace' sein, nicht {mode}"}
+        rel = f"05_Projects/{project}/CONTEXT.md"
+        p = vault.safe_path(rel)
+        if not p.parent.is_dir():
+            return {"error": f"Projekt-Folder nicht gefunden: 05_Projects/{project}/"}
+        if mode == "replace" or not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            content = f"# Projekt-Kontext: {project}\n\n_Updated: {vault.today_iso()}_\n\n{text.strip()}\n"
+            p.write_text(content, encoding="utf-8")
+        else:
+            existing = p.read_text(encoding="utf-8").replace("\r\n", "\n")
+            appendix = f"\n## {vault.today_iso()}\n{text.strip()}\n"
+            p.write_text(existing.rstrip() + appendix, encoding="utf-8")
+        return {"path": rel, "mode": mode}
+    except VaultError as e:
         return {"error": str(e)}
 
 
