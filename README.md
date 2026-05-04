@@ -12,7 +12,7 @@ Client (Claude Code / claude.ai / Cursor / ...)
    Caddy :443                      ← TLS terminieren (Let's Encrypt)
         │
         ▼ http (intern, docker-Netzwerk)
-   ki-os-mcp :3002                 ← MCP Streamable HTTP
+   ki-os-mcp :5002                 ← MCP Streamable HTTP
         │
         ▼ Filesystem
    /opt/vault/KI_WIKI_Vault        ← Markdown + YAML Frontmatter
@@ -78,7 +78,7 @@ $env:MCP_TOKEN = "devtoken"
 python -m ki_os_mcp.server
 ```
 
-Healthcheck: `curl http://localhost:3002/health`
+Healthcheck: `curl http://localhost:5002/health`
 
 ## VPS-Deploy (im KI-OS Stack)
 

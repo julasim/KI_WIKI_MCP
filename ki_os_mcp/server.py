@@ -48,7 +48,7 @@ MCP_TOKEN = os.environ.get("MCP_TOKEN", "").strip()
 # Optional zweiter Token für Rotation (alter bleibt 24h gültig nach Wechsel)
 MCP_TOKEN_LEGACY = os.environ.get("MCP_TOKEN_LEGACY", "").strip()
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
-MCP_PORT = int(os.environ.get("MCP_PORT", "3002"))
+MCP_PORT = int(os.environ.get("MCP_PORT", "5002"))
 
 if not MCP_TOKEN:
     log.warning(

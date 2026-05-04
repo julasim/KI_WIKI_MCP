@@ -15,8 +15,8 @@ RUN pip install --no-cache-dir .
 ENV PYTHONUNBUFFERED=1 \
     VAULT_PATH=/vault \
     MCP_HOST=0.0.0.0 \
-    MCP_PORT=3002
+    MCP_PORT=5002
 
-EXPOSE 3002
+EXPOSE 5002
 
 CMD ["python", "-m", "ki_os_mcp.server"]
