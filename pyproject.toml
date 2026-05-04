@@ -1,0 +1,19 @@
+[project]
+name = "ki-os-mcp"
+version = "0.1.0"
+description = "KI-OS MCP Server — Vault-Tools für Claude Code & andere MCP-Clients"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp[cli]>=1.2.0",
+    "starlette>=0.37.0",
+    "uvicorn[standard]>=0.30.0",
+    "pyyaml>=6.0.1",
+    "python-frontmatter>=1.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ki_os_mcp"]
