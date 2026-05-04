@@ -156,6 +156,27 @@ def find_wikilink_refs(target_id: str) -> list[tuple[Path, list[int]]]:
     return out
 
 
+def find_related_refs(target_id: str) -> list[Path]:
+    """Findet alle .md-Files die `target_id` in ihrer Frontmatter
+    `related[]`-Liste haben (egal ob auch im Body verlinkt oder nicht).
+    """
+    target = target_id.strip()
+    out: list[Path] = []
+    for path in walk_md():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        try:
+            post = frontmatter.loads(text)
+        except Exception:  # noqa: BLE001
+            continue
+        related = post.metadata.get("related")
+        if isinstance(related, list) and target in related:
+            out.append(path)
+    return out
+
+
 def replace_wikilinks(text: str, old_id: str, new_id: str) -> tuple[str, int]:
     """Ersetzt alle [[old_id]] / [[old_id|display]] / [[old_id#anchor]] etc.
     durch new_id, behält display + anchor bei. Returns (new_text, count).

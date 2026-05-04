@@ -751,13 +751,22 @@ def move(
             if date_prefix.match(new_id):
                 new_id = date_prefix.sub("", new_id)
 
-        # Wikilink-Refs sammeln
+        # Wikilink-Refs sammeln + Related-Refs (FM-Felder mit old_id in `related[]`)
         refs: list[tuple[Any, list[int]]] = []
+        related_only_paths: list[Any] = []  # Files mit related[] aber ohne Body-WL
         if old_id and new_id and old_id != new_id and update_links:
             refs = vault.find_wikilink_refs(old_id)
+            wl_paths = {p for p, _ in refs}
+            for p in vault.find_related_refs(old_id):
+                if p not in wl_paths:
+                    related_only_paths.append(p)
 
         refs_summary = [
-            {"path": vault.rel_path(p), "lines": lines} for p, lines in refs
+            {"path": vault.rel_path(p), "lines": lines, "kind": "wikilink"}
+            for p, lines in refs
+        ] + [
+            {"path": vault.rel_path(p), "lines": [], "kind": "related-fm-only"}
+            for p in related_only_paths
         ]
 
         if dry_run:
@@ -799,10 +808,12 @@ def move(
             parent.rmdir()
             parent = parent.parent
 
-        # Wikilink-Updates in anderen Files
+        # Wikilink-Updates + FM related[] Updates in anderen Files
         updated_files: list[dict[str, Any]] = []
         if old_id and new_id and old_id != new_id and update_links:
-            for path, _lines in refs:
+            # Vereinige: Files mit Body-Wikilinks + Files mit nur related[] FM
+            all_paths_to_check = [p for p, _ in refs] + related_only_paths
+            for path in all_paths_to_check:
                 # File evtl. = unsere neue Datei (selbstreferenz)? Skip wenn ja.
                 if path == dst:
                     continue
