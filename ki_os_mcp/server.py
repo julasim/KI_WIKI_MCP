@@ -24,6 +24,7 @@ from typing import Any
 import frontmatter
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -54,7 +55,17 @@ if not MCP_TOKEN:
 
 # streamable_http_path="/" damit der Mount unter /mcp die Tools direkt
 # unter /mcp serviert (nicht unter /mcp/mcp).
-mcp = FastMCP("ki-os-vault", streamable_http_path="/")
+#
+# transport_security mit deaktivierter DNS-Rebinding-Protection: FastMCP
+# enabled das auto-magisch wenn host="127.0.0.1" (default) und blockt dann
+# alle Host-Header außer localhost — was uns von extern aussperrt (HTTP 421).
+# Unsere Bearer-Auth davor verhindert Rebinding-Angriffe schon (Browser hat
+# den Token nicht), darum ist Disable hier sicher.
+mcp = FastMCP(
+    "ki-os-vault",
+    streamable_http_path="/",
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 # ---------- Tools ------------------------------------------------------------
