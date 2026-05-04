@@ -355,15 +355,23 @@ def create_app() -> Starlette:
         async with mcp_app.router.lifespan_context(app):
             yield
 
-    return Starlette(
+    app = Starlette(
         debug=False,
         middleware=[Middleware(BearerAuthMiddleware)],
         routes=[
             Route("/health", endpoint=health, methods=["GET"]),
+            # Mount sowohl auf /mcp als auch /mcp/ damit Clients ohne
+            # trailing-slash NICHT auf 307-Redirect laufen (claude.ai folgt
+            # dem nicht und meldet "unexpected redirect").
             Mount("/mcp", app=mcp_app),
+            Mount("/mcp/", app=mcp_app),
         ],
         lifespan=lifespan,
     )
+    # Starlette router redirect_slashes default = True — explizit aus,
+    # weil wir oben beide Mount-Pfade direkt registrieren.
+    app.router.redirect_slashes = False
+    return app
 
 
 def main() -> None:
