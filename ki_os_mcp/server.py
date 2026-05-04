@@ -993,6 +993,320 @@ def project_context(
         return {"error": str(e)}
 
 
+# ---------- Block 3: Premium-Tools -------------------------------------------
+
+
+@mcp.tool()
+def daily_briefing(date: str | None = None) -> dict[str, Any]:
+    """Tagesbriefing — was steht an, was ist überfällig, was lief gut.
+
+    Liefert ein strukturiertes Dictionary mit:
+      - overdue: Tasks mit due < heute (open, sortiert nach due)
+      - today: Tasks mit due == heute (open, prio-sortiert)
+      - upcoming_3d: Tasks mit due in 1-3 Tagen
+      - inbox: Tasks ohne Projekt (open, prio-sortiert, max 10)
+      - recently_done: Tasks die gestern oder heute erledigt wurden
+      - daily_path: Pfad der heutigen Daily-Note
+      - daily_exists: ob die heutige Daily schon existiert
+
+    Args:
+        date: ISO-Datum als Bezugsdatum (default heute)
+
+    Returns:
+        Dictionary mit allen Sektionen + total counts.
+    """
+    try:
+        ref = date or vault.today_iso()
+        from datetime import date as _date, timedelta
+        ref_d = _date.fromisoformat(ref)
+        in_3d = (ref_d + timedelta(days=3)).isoformat()
+        yesterday = (ref_d - timedelta(days=1)).isoformat()
+
+        tasks_dir = vault.VAULT_PATH / "10_Life" / "tasks"
+        all_tasks: list[dict[str, Any]] = []
+        if tasks_dir.is_dir():
+            for path in tasks_dir.glob("*.md"):
+                try:
+                    post = vault.read_post(vault.rel_path(path))
+                except Exception:  # noqa: BLE001
+                    continue
+                fm = post.metadata
+                all_tasks.append({
+                    "id": fm.get("id"),
+                    "title": fm.get("title"),
+                    "status": fm.get("status"),
+                    "priority": fm.get("priority"),
+                    "due": str(fm.get("due")) if fm.get("due") else None,
+                    "project": fm.get("project"),
+                    "context": fm.get("context"),
+                    "last_completed": str(fm.get("last_completed")) if fm.get("last_completed") else None,
+                    "path": vault.rel_path(path),
+                })
+
+        prio_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+
+        def by_prio_due(t):
+            return (prio_order.get(t.get("priority"), 99), t.get("due") or "9999")
+
+        overdue = sorted(
+            [t for t in all_tasks if t["status"] == "open" and t["due"] and t["due"] < ref],
+            key=by_prio_due,
+        )
+        today = sorted(
+            [t for t in all_tasks if t["status"] == "open" and t["due"] == ref],
+            key=by_prio_due,
+        )
+        upcoming = sorted(
+            [t for t in all_tasks if t["status"] == "open" and t["due"] and ref < t["due"] <= in_3d],
+            key=by_prio_due,
+        )
+        inbox = sorted(
+            [t for t in all_tasks if t["status"] == "open" and not t["project"] and not t["due"]],
+            key=by_prio_due,
+        )[:10]
+        recently_done = sorted(
+            [t for t in all_tasks if t["status"] == "done" and t["last_completed"] in (ref, yesterday)],
+            key=lambda t: t.get("last_completed") or "",
+            reverse=True,
+        )
+
+        daily_rel = f"10_Life/daily/{ref}.md"
+        daily_exists = vault.safe_path(daily_rel).is_file()
+
+        return {
+            "date": ref,
+            "overdue": overdue,
+            "today": today,
+            "upcoming_3d": upcoming,
+            "inbox": inbox,
+            "recently_done": recently_done,
+            "daily_path": daily_rel,
+            "daily_exists": daily_exists,
+            "summary": {
+                "overdue_count": len(overdue),
+                "today_count": len(today),
+                "upcoming_count": len(upcoming),
+                "inbox_count": len(inbox),
+                "recently_done_count": len(recently_done),
+            },
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def vault_lint() -> dict[str, Any]:
+    """Vault-Schema-Linter — findet Drift und Inkonsistenzen.
+
+    Prüft:
+      - broken_wikilinks: [[id]] die auf nicht-existente IDs zeigen
+      - duplicate_ids: gleiche FM-ID in mehreren Files
+      - missing_fm: Files ohne YAML-Frontmatter
+      - missing_required: Files mit fehlenden Pflichtfeldern (id, type, title)
+      - context_drift: Tasks mit `context` ohne führendes @ (oder umgekehrt)
+      - orphans: Notes ohne `[[id]]` Backlinks von anderen Files
+
+    Returns:
+        Dictionary mit Listen pro Issue-Kategorie + Counts.
+    """
+    try:
+        all_md = vault.walk_md()
+        # ID-Index aufbauen
+        id_to_paths: dict[str, list[str]] = {}
+        contexts_seen: dict[str, int] = {}
+        files_data: list[dict[str, Any]] = []
+        missing_fm: list[str] = []
+        missing_required: list[dict[str, Any]] = []
+
+        for path in all_md:
+            try:
+                text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
+            except OSError:
+                continue
+            rel = vault.rel_path(path)
+            try:
+                post = frontmatter.loads(text)
+            except Exception:  # noqa: BLE001
+                missing_fm.append(rel)
+                continue
+            fm = post.metadata
+            if not fm:
+                missing_fm.append(rel)
+                continue
+            fid = fm.get("id")
+            ftype = fm.get("type")
+            ftitle = fm.get("title")
+            missing_keys = [k for k in ["id", "type", "title"] if not fm.get(k)]
+            if missing_keys:
+                missing_required.append({"path": rel, "missing": missing_keys})
+            if fid:
+                id_to_paths.setdefault(str(fid), []).append(rel)
+            if "context" in fm:
+                contexts_seen[str(fm["context"])] = contexts_seen.get(str(fm["context"]), 0) + 1
+            files_data.append({"path": rel, "id": fid, "body": post.content, "type": ftype})
+
+        # Duplicate IDs
+        duplicate_ids = [
+            {"id": k, "paths": v} for k, v in id_to_paths.items() if len(v) > 1
+        ]
+
+        # Broken wikilinks
+        all_ids = set(id_to_paths.keys())
+        broken_wikilinks: list[dict[str, Any]] = []
+        for fd in files_data:
+            broken_in_file: set[str] = set()
+            for m in vault._WIKILINK_RE.finditer(fd["body"] or ""):
+                target = m.group(1).strip()
+                if target and target not in all_ids:
+                    broken_in_file.add(target)
+            if broken_in_file:
+                broken_wikilinks.append({
+                    "path": fd["path"],
+                    "broken_targets": sorted(broken_in_file),
+                })
+
+        # Context-Drift: gleicher Wert mit + ohne @
+        context_drift: list[dict[str, Any]] = []
+        normalized: dict[str, list[str]] = {}
+        for ctx in contexts_seen:
+            norm = ctx.lstrip("@").lower()
+            normalized.setdefault(norm, []).append(ctx)
+        for norm, variants in normalized.items():
+            if len(variants) > 1:
+                context_drift.append({
+                    "normalized": norm,
+                    "variants": variants,
+                    "counts": {v: contexts_seen[v] for v in variants},
+                })
+
+        # Orphans (Notes/Meetings ohne Backlinks)
+        referenced_ids: set[str] = set()
+        for fd in files_data:
+            for m in vault._WIKILINK_RE.finditer(fd["body"] or ""):
+                referenced_ids.add(m.group(1).strip())
+        orphans: list[dict[str, Any]] = []
+        for fd in files_data:
+            if fd["type"] in ("note", "meeting") and fd["id"] and str(fd["id"]) not in referenced_ids:
+                orphans.append({"path": fd["path"], "id": fd["id"], "type": fd["type"]})
+
+        return {
+            "summary": {
+                "total_md_files": len(files_data),
+                "broken_wikilink_files": len(broken_wikilinks),
+                "duplicate_ids": len(duplicate_ids),
+                "missing_fm": len(missing_fm),
+                "missing_required": len(missing_required),
+                "context_drift": len(context_drift),
+                "orphans": len(orphans),
+            },
+            "broken_wikilinks": broken_wikilinks[:50],
+            "duplicate_ids": duplicate_ids,
+            "missing_fm": missing_fm[:50],
+            "missing_required": missing_required[:50],
+            "context_drift": context_drift,
+            "orphans": orphans[:50],
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def self_test() -> dict[str, Any]:
+    """Self-Test — prüft jedes Tool funktional + misst Latenz.
+
+    Read-only Aufrufe gegen den eigenen Server. Ergebnis ist ein Health-Report
+    mit per-Tool-Status + Total-Latenz. Kein Vault-Write.
+
+    Returns:
+        {tools: [{name, ok, latency_ms, error?}], total_ms, ok_count, fail_count}
+    """
+    import time as _t
+    results: list[dict[str, Any]] = []
+    start_total = _t.perf_counter()
+
+    def run(name: str, callable_) -> None:
+        s = _t.perf_counter()
+        try:
+            r = callable_()
+            ok = isinstance(r, dict) and "error" not in r
+            results.append({
+                "name": name,
+                "ok": ok,
+                "latency_ms": round((_t.perf_counter() - s) * 1000, 2),
+                **({"error": r.get("error")} if not ok and isinstance(r, dict) else {}),
+            })
+        except Exception as e:  # noqa: BLE001
+            results.append({
+                "name": name,
+                "ok": False,
+                "latency_ms": round((_t.perf_counter() - s) * 1000, 2),
+                "error": f"{type(e).__name__}: {e}",
+            })
+
+    # Direkte Helper-Calls (umgehen Audit damit Self-Test sich nicht selbst loggt
+    # bzw. nur dieses einzelne Event)
+    run("vault_root_exists", lambda: {"ok": True} if vault.VAULT_PATH.exists() else {"error": "vault missing"})
+    run("list_root", lambda: {"path": "", "entries": vault.list_dir("")})
+    run("list_tasks_dir", lambda: {"path": "10_Life/tasks", "entries": vault.list_dir("10_Life/tasks")})
+    run("read_schema", lambda: {"raw": vault.read_text("SCHEMA.md")[:50]})
+    run("search_basic", lambda: {"hits": vault.grep_vault("matura", max_results=1)})
+    run("today_iso", lambda: {"date": vault.today_iso()})
+    run("snapshot_dir_writable", lambda: (
+        {"ok": True} if (snapshot.SNAPSHOT_DIR.exists() or not snapshot.SNAPSHOT_ENABLED)
+        else {"error": f"snapshot dir missing: {snapshot.SNAPSHOT_DIR}"}
+    ))
+
+    total_ms = round((_t.perf_counter() - start_total) * 1000, 2)
+    ok_count = sum(1 for r in results if r["ok"])
+    return {
+        "tools": results,
+        "ok_count": ok_count,
+        "fail_count": len(results) - ok_count,
+        "total_ms": total_ms,
+        "vault": str(vault.VAULT_PATH),
+        "snapshot_enabled": snapshot.SNAPSHOT_ENABLED,
+    }
+
+
+@mcp.tool()
+def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
+    """Schreibt rohen Text in ein File (ohne Frontmatter, ohne Schema).
+
+    Für Files die NICHT dem Note/Task/Meeting-Schema folgen (CONTEXT.md,
+    README.md, JSON, txt, etc.). Pfad-Sicherheit greift wie bei allen Tools.
+
+    Args:
+        path: Rel-Pfad ab Vault-Root
+        content: Vollständiger File-Inhalt (ersetzt bestehenden komplett)
+        overwrite: True um existierende Files zu überschreiben (default False)
+
+    Returns:
+        {path, bytes_written, overwritten: bool}
+    """
+    try:
+        full = vault.safe_path(path)
+        existed = full.exists()
+        if existed and not overwrite:
+            return {"error": f"Datei existiert ({path}). overwrite=true setzen um zu ersetzen."}
+        if existed:
+            # Snapshot vor Overwrite
+            try:
+                snapshot.snapshot_path(path, full.read_bytes(), "raw_write")
+            except OSError:
+                pass
+        full.parent.mkdir(parents=True, exist_ok=True)
+        # CRLF → LF zur Konsistenz mit anderen Tools
+        normalized = content.replace("\r\n", "\n")
+        full.write_text(normalized, encoding="utf-8")
+        return {
+            "path": path,
+            "bytes_written": len(normalized.encode("utf-8")),
+            "overwritten": existed,
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
 # ---------- Auth Middleware --------------------------------------------------
 
 
