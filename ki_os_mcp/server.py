@@ -153,28 +153,32 @@ def create_note(
     tags: list[str] | None = None,
     subpath: str = "notes",
 ) -> dict[str, Any]:
-    """Erstellt eine neue Markdown-Note.
+    """Erstellt eine neue Markdown-Note (gemäß SCHEMA.md).
+
+    Path-Logik:
+      - Generic (kein project): 10_Life/notes/YYYY-MM-DD_<slug>.md
+      - Projekt-bezogen:        05_Projects/<project>/<subpath>/YYYY-MM-DD_<slug>.md
+
+    ID = <slug> (ohne Datum-Präfix, ohne note- Prefix — Schema §7).
 
     Args:
-        title: Note-Titel (wird auch zu Slug)
-        project: Optional Projekt-Slug (z.B. "dachboden-ausbau"). Wenn gesetzt,
-            landet die Note in 01_Projects/{project}/{subpath}/{slug}.md.
-            Sonst in 02_Wiki/notes/{slug}.md.
+        title: Note-Titel (wird zu Slug)
+        project: Optional Projekt-Slug (z.B. "dachboden-ausbau")
         body: Markdown-Body
-        tags: Liste von Tags
-        subpath: Subfolder im Projekt (default "notes", z.B. auch "meetings")
+        tags: Liste von Tags (ohne führendes #)
+        subpath: Subfolder im Projekt (default "notes", auch "meetings")
 
     Returns:
         {path, id, created}
     """
     try:
         slug = vault.slugify(title)
+        date = vault.today_iso()
+        filename = f"{date}_{slug}.md"
         if project:
-            rel = f"01_Projects/{project}/{subpath}/{slug}.md"
-            note_id = f"{project}-{subpath}-{slug}"
+            rel = f"05_Projects/{project}/{subpath}/{filename}"
         else:
-            rel = f"02_Wiki/notes/{slug}.md"
-            note_id = f"note-{slug}"
+            rel = f"10_Life/notes/{filename}"
 
         # Existiert schon?
         try:
@@ -187,18 +191,18 @@ def create_note(
         post = frontmatter.Post(
             body,
             **{
-                "id": note_id,
+                "id": slug,
                 "type": "note",
                 "title": title,
-                "created": vault.today_iso(),
-                "updated": vault.today_iso(),
-                "status": "active",
+                "created": date,
+                "updated": date,
+                "status": "draft",
                 "tags": tags or [],
                 **({"project": project} if project else {}),
             },
         )
         vault.write_post(rel, post)
-        return {"path": rel, "id": note_id, "created": vault.today_iso()}
+        return {"path": rel, "id": slug, "created": date}
     except VaultError as e:
         return {"error": str(e)}
 
@@ -212,11 +216,17 @@ def create_task(
     context: str | None = None,
     body: str = "",
 ) -> dict[str, Any]:
-    """Erstellt einen neuen Task in 02_System/tasks/.
+    """Erstellt einen neuen Task in 10_Life/tasks/ (gemäß SCHEMA.md).
+
+    Tasks bleiben IMMER zentral in 10_Life/tasks/, auch wenn projekt-bezogen
+    (Projekt via Frontmatter `project: <slug>`).
+
+    Path:  10_Life/tasks/<slug>.md
+    ID:    t-<slug> (Schema §7)
 
     Args:
         title: Task-Titel
-        project: Optional Projekt-Slug
+        project: Optional Projekt-Slug (kommt nur ins Frontmatter, nicht ins Path)
         priority: urgent | high | medium | low (default medium)
         due: ISO-Datum (YYYY-MM-DD) oder None
         context: Kontext-Tag wie "@home", "@work", "@phone"
@@ -230,7 +240,7 @@ def create_task(
             return {"error": f"Ungültige Priorität: {priority}"}
         slug = vault.slugify(title)
         task_id = f"t-{slug}"
-        rel = f"02_System/tasks/{task_id}.md"
+        rel = f"10_Life/tasks/{slug}.md"
 
         try:
             if vault.safe_path(rel).exists():
