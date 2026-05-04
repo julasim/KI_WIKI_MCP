@@ -32,7 +32,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-from ki_os_mcp import vault
+from ki_os_mcp import audit, snapshot, vault
+from ki_os_mcp.ratelimit import RateLimitMiddleware
 from ki_os_mcp.vault import VaultError
 
 # ---------- Setup ------------------------------------------------------------
@@ -43,7 +44,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("ki-os-mcp")
 
-MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
+MCP_TOKEN = os.environ.get("MCP_TOKEN", "").strip()
+# Optional zweiter Token für Rotation (alter bleibt 24h gültig nach Wechsel)
+MCP_TOKEN_LEGACY = os.environ.get("MCP_TOKEN_LEGACY", "").strip()
 MCP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.environ.get("MCP_PORT", "3002"))
 
@@ -52,6 +55,11 @@ if not MCP_TOKEN:
         "MCP_TOKEN ist leer — Server läuft OHNE Auth. "
         "Setze MCP_TOKEN für Production!"
     )
+if MCP_TOKEN_LEGACY:
+    log.info("Legacy-Token aktiv — Multi-Token-Mode (Rotation läuft).")
+
+# Set für O(1) Token-Lookup
+_VALID_TOKENS = {t for t in (MCP_TOKEN, MCP_TOKEN_LEGACY) if t}
 
 # streamable_http_path="/" damit der Mount unter /mcp die Tools direkt
 # unter /mcp serviert (nicht unter /mcp/mcp).
@@ -448,6 +456,10 @@ def edit_file(
         {path, frontmatter, body_preview} mit dem geupdatetem Stand
     """
     try:
+        # Snapshot vorher (nur wenn body geändert wird oder destruktive FM-Ops)
+        before_bytes = vault.safe_path(path).read_bytes()
+        snapshot.snapshot_path(path, before_bytes, "edit")
+
         post = vault.read_post(path)
         if frontmatter_updates:
             for k, v in frontmatter_updates.items():
@@ -682,10 +694,15 @@ def confirm_delete(token: str) -> dict[str, Any]:
     if not pending:
         return {"error": f"Token unbekannt oder abgelaufen: {token}"}
     try:
-        vault.delete_file(pending["path"])
+        # Snapshot vor Delete
+        path = pending["path"]
+        full = vault.safe_path(path)
+        if full.is_file():
+            snapshot.snapshot_path(path, full.read_bytes(), "delete")
+        vault.delete_file(path)
         return {
             "deleted": True,
-            "path": pending["path"],
+            "path": path,
             "requested_at": pending["requested_at"],
             "reason": pending.get("reason", ""),
         }
@@ -782,6 +799,25 @@ def move(
                 "wikilink_refs": refs_summary,
                 "would_update_files": len(refs_summary),
             }
+
+        # Snapshot vorher: source + alle to-be-updated Files
+        snapshot_files: dict[str, bytes] = {}
+        try:
+            snapshot_files[source] = src.read_bytes()
+        except OSError:
+            pass
+        for p in (
+            [pp for pp, _ in refs] + related_only_paths
+            if (old_id and new_id and old_id != new_id and update_links)
+            else []
+        ):
+            if p == dst:
+                continue
+            try:
+                snapshot_files[vault.rel_path(p)] = p.read_bytes()
+            except OSError:
+                pass
+        snapshot.snapshot("move", snapshot_files)
 
         # Echter Move
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -961,41 +997,69 @@ def project_context(
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Validiert `Authorization: Bearer <token>` gegen MCP_TOKEN.
+    """Validiert `Authorization: Bearer <token>` gegen MCP_TOKEN(_LEGACY).
 
     Ausnahmen:
       - GET /health  (für Docker-healthcheck)
       - leerer MCP_TOKEN deaktiviert Auth (dev-only, Warnung beim Boot)
+
+    Auth-Events werden audit-geloggt (success + fail).
     """
 
     async def dispatch(self, request: Request, call_next):
         if request.url.path == "/health":
             return await call_next(request)
-        if not MCP_TOKEN:
+        if not _VALID_TOKENS:
             return await call_next(request)
+
+        client_ip = (
+            request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+            or (request.client.host if request.client else "unknown")
+        )
+        ua = request.headers.get("user-agent", "")[:120]
+
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
-            return JSONResponse(
-                {"error": "Missing Bearer token"}, status_code=401
-            )
+            audit.log_auth(False, client_ip, "Missing Bearer prefix", ua)
+            return JSONResponse({"error": "Missing Bearer token"}, status_code=401)
         token = auth.removeprefix("Bearer ").strip()
-        if token != MCP_TOKEN:
-            return JSONResponse(
-                {"error": "Invalid token"}, status_code=401
-            )
+        if token not in _VALID_TOKENS:
+            audit.log_auth(False, client_ip, "Invalid token", ua)
+            return JSONResponse({"error": "Invalid token"}, status_code=401)
+        # Wenn Legacy-Token verwendet wird, in Audit hervorheben
+        if MCP_TOKEN_LEGACY and token == MCP_TOKEN_LEGACY:
+            audit.log_auth(True, client_ip, "legacy token", ua)
         return await call_next(request)
 
 
 # ---------- Health Endpoint --------------------------------------------------
 
 
+_BOOT_TIME = None
+
+
 async def health(_: Request) -> JSONResponse:
+    from ki_os_mcp import __version__
+    import time as _t
+    global _BOOT_TIME
+    if _BOOT_TIME is None:
+        _BOOT_TIME = _t.time()
+    try:
+        tools_count = len(mcp._tool_manager._tools)  # type: ignore[attr-defined]
+    except AttributeError:
+        tools_count = 0
     return JSONResponse(
         {
             "status": "ok",
+            "version": __version__,
             "vault": str(vault.VAULT_PATH),
             "vault_exists": vault.VAULT_PATH.exists(),
-            "auth": "enabled" if MCP_TOKEN else "DISABLED",
+            "auth": "enabled" if _VALID_TOKENS else "DISABLED",
+            "auth_legacy_active": bool(MCP_TOKEN_LEGACY),
+            "tools": tools_count,
+            "uptime_seconds": int(_t.time() - _BOOT_TIME),
+            "rate_limit_per_min": int(os.environ.get("MCP_RATE_LIMIT_PER_MIN", "60")),
+            "snapshot_enabled": os.environ.get("MCP_SNAPSHOT_ENABLED", "1") not in ("0", "false", "no"),
         }
     )
 
@@ -1003,35 +1067,65 @@ async def health(_: Request) -> JSONResponse:
 # ---------- App-Wiring -------------------------------------------------------
 
 
+def _wrap_tools_with_audit() -> None:
+    """Wrap alle registrierten FastMCP-Tools mit dem Audit-Logger.
+
+    Jeder Tool-Call landet als JSONL-Line in MCP_AUDIT_LOG.
+    """
+    # FastMCP._tool_manager._tools : dict[name, Tool]
+    try:
+        tools = mcp._tool_manager._tools  # type: ignore[attr-defined]
+    except AttributeError:
+        log.warning("Konnte FastMCP-Tools nicht für Audit wrappen")
+        return
+    wrapped = 0
+    for name, tool in tools.items():
+        original_fn = tool.fn  # type: ignore[attr-defined]
+        if getattr(original_fn, "_audit_wrapped", False):
+            continue
+        wrapped_fn = audit.time_call(original_fn)
+        wrapped_fn._audit_wrapped = True  # type: ignore[attr-defined]
+        wrapped_fn.__name__ = name  # für Audit-Log
+        tool.fn = wrapped_fn  # type: ignore[attr-defined]
+        wrapped += 1
+    log.info("Audit-Wrapper aktiv für %d Tools", wrapped)
+
+
 def create_app() -> Starlette:
     """Mount MCP's Streamable-HTTP transport on /mcp + health on /health.
 
-    Delegiert den lifespan an das innere MCP-App damit dessen
-    session_manager korrekt initialisiert wird (Starlette triggert
-    lifespan von gemounteten ASGI-Apps nicht automatisch).
+    Middleware-Reihenfolge (outermost zuerst):
+      1. RateLimit  → blockt Brute-Force/DoS (429)
+      2. BearerAuth → 401 wenn Token fehlt/falsch
+      3. (MCP-Handler oder /health-Route)
+
+    Delegiert lifespan an mcp_app damit dessen session_manager initialisiert.
     """
+    _wrap_tools_with_audit()
     mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
+        audit.log_event("server_start", host=MCP_HOST, port=MCP_PORT,
+                        auth=bool(_VALID_TOKENS), legacy=bool(MCP_TOKEN_LEGACY))
         async with mcp_app.router.lifespan_context(app):
             yield
+        audit.log_event("server_stop")
 
     app = Starlette(
         debug=False,
-        middleware=[Middleware(BearerAuthMiddleware)],
+        middleware=[
+            Middleware(RateLimitMiddleware),  # OUTER: erst Rate-Limit ...
+            Middleware(BearerAuthMiddleware),  # ... dann Auth
+        ],
         routes=[
             Route("/health", endpoint=health, methods=["GET"]),
-            # Mount sowohl auf /mcp als auch /mcp/ damit Clients ohne
-            # trailing-slash NICHT auf 307-Redirect laufen (claude.ai folgt
-            # dem nicht und meldet "unexpected redirect").
+            # Beide Pfade ohne 307-Redirect (claude.ai BETA folgt nicht).
             Mount("/mcp", app=mcp_app),
             Mount("/mcp/", app=mcp_app),
         ],
         lifespan=lifespan,
     )
-    # Starlette router redirect_slashes default = True — explizit aus,
-    # weil wir oben beide Mount-Pfade direkt registrieren.
     app.router.redirect_slashes = False
     return app
 
