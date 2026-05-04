@@ -189,6 +189,11 @@ def list_tasks(
         all_count = 0
         matched: list[dict[str, Any]] = []
 
+        # Context-Filter normalisieren: Vault-Convention ist drift (mal "@home",
+        # mal "home"). Wir strippen das @ beidseitig damit beide Schreibweisen
+        # matchen.
+        ctx_norm = context.lstrip("@").lower() if context else None
+
         for path in tasks_dir.glob("*.md"):
             all_count += 1
             try:
@@ -209,8 +214,10 @@ def list_tasks(
                 continue
             if priority and t_priority != priority:
                 continue
-            if context and t_context != context:
-                continue
+            if ctx_norm:
+                t_ctx_norm = (t_context or "").lstrip("@").lower()
+                if t_ctx_norm != ctx_norm:
+                    continue
             if due_until and (not t_due or str(t_due) > due_until):
                 continue
             if overdue_only:
