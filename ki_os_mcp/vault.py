@@ -99,6 +99,34 @@ def write_post(rel: str, post: frontmatter.Post) -> None:
     p.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
 
 
+def delete_file(rel: str) -> None:
+    """Löscht eine Datei aus dem Vault. Räumt leere Parent-Folder auf."""
+    p = safe_path(rel)
+    if not p.is_file():
+        raise VaultError(f"Datei nicht gefunden: {rel}")
+    p.unlink()
+    # Leere Eltern-Folder aufräumen (bis VAULT_PATH, exklusiv)
+    parent = p.parent
+    while parent != VAULT_PATH and parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
+
+
+# ---------- Task-Finder -------------------------------------------------------
+
+
+def find_task(task_id_or_slug: str) -> Path | None:
+    """Findet einen Task per ID (`t-foo`) oder slug (`foo`).
+
+    Tasks liegen in 10_Life/tasks/<slug>.md. Filename ist slug ohne `t-` Prefix.
+    """
+    slug = task_id_or_slug.removeprefix("t-")
+    candidate = VAULT_PATH / "10_Life" / "tasks" / f"{slug}.md"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 # ---------- Listing -----------------------------------------------------------
 
 

@@ -295,6 +295,276 @@ def append_to_daily(
         return {"error": str(e)}
 
 
+# ---------- Phase 2 Tools ----------------------------------------------------
+
+
+@mcp.tool()
+def edit_file(
+    path: str,
+    frontmatter_updates: dict[str, Any] | None = None,
+    body: str | None = None,
+) -> dict[str, Any]:
+    """Editiert eine existierende Markdown-Datei.
+
+    Update-Logik:
+      - frontmatter_updates: dict-merge in bestehendes Frontmatter
+        (None-Werte LÖSCHEN das Feld; sonst überschreiben/hinzufügen)
+      - body: wenn nicht None, ersetzt den kompletten Body
+      - `updated` wird automatisch auf heute gesetzt
+
+    Args:
+        path: Rel-Pfad zur Datei
+        frontmatter_updates: dict mit FM-Felder zum mergen (None=Feld löschen)
+        body: neuer Body (None = unverändert lassen)
+
+    Returns:
+        {path, frontmatter, body_preview} mit dem geupdatetem Stand
+    """
+    try:
+        post = vault.read_post(path)
+        if frontmatter_updates:
+            for k, v in frontmatter_updates.items():
+                if v is None:
+                    post.metadata.pop(k, None)
+                else:
+                    post[k] = v
+        if body is not None:
+            post.content = body
+        vault.write_post(path, post)
+        # Re-read für preview
+        post2 = vault.read_post(path)
+        preview = post2.content[:300] + ("..." if len(post2.content) > 300 else "")
+        return {
+            "path": path,
+            "frontmatter": dict(post2.metadata),
+            "body_preview": preview,
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def task(
+    id: str,
+    action: str,
+    due: str | None = None,
+    priority: str | None = None,
+    body: str | None = None,
+    snooze_until: str | None = None,
+) -> dict[str, Any]:
+    """Statusänderungen + Edits an existierenden Tasks.
+
+    Actions:
+      - `done`:   status='done', last_completed=heute (für recurring)
+      - `reopen`: status='open', löscht last_completed
+      - `snooze`: status='snoozed', setzt due=snooze_until (Pflicht-Param)
+      - `edit`:   updated due/priority/body (nur was übergeben wird)
+
+    Args:
+        id: Task-ID (`t-foo`) oder slug (`foo`)
+        action: done | reopen | snooze | edit
+        due: Neue Due-Date (für edit), oder snooze_until-Fallback
+        priority: Neue Priority (für edit): urgent|high|medium|low
+        body: Neuer Body (für edit)
+        snooze_until: ISO-Datum bis wann (für snooze, Pflicht)
+
+    Returns:
+        {path, id, status, action_applied}
+    """
+    try:
+        if action not in ("done", "reopen", "snooze", "edit"):
+            return {"error": f"Unbekannte action: {action} (erlaubt: done|reopen|snooze|edit)"}
+
+        task_path = vault.find_task(id)
+        if not task_path:
+            return {"error": f"Task nicht gefunden: {id}"}
+        rel = vault.rel_path(task_path)
+        post = vault.read_post(rel)
+
+        if action == "done":
+            post["status"] = "done"
+            post["last_completed"] = vault.today_iso()
+        elif action == "reopen":
+            post["status"] = "open"
+            post.metadata.pop("last_completed", None)
+        elif action == "snooze":
+            target = snooze_until or due
+            if not target:
+                return {"error": "snooze braucht snooze_until (oder due) Parameter"}
+            post["status"] = "snoozed"
+            post["due"] = target
+        elif action == "edit":
+            if priority is not None:
+                if priority not in ("urgent", "high", "medium", "low"):
+                    return {"error": f"Ungültige Priorität: {priority}"}
+                post["priority"] = priority
+            if due is not None:
+                post["due"] = due
+            if body is not None:
+                post.content = body
+
+        vault.write_post(rel, post)
+        return {
+            "path": rel,
+            "id": post.metadata.get("id"),
+            "status": post.metadata.get("status"),
+            "action_applied": action,
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def create_meeting(
+    title: str,
+    attendees: list[str],
+    project: str | None = None,
+    date: str | None = None,
+    location: str | None = None,
+    duration: str | None = None,
+    body: str = "",
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Erstellt ein Meeting (gemäß SCHEMA.md).
+
+    Path-Logik (analog create_note):
+      - Generic:        10_Life/meetings/YYYY-MM-DD_<slug>.md
+      - Projekt-bezogen: 05_Projects/<project>/meetings/YYYY-MM-DD_<slug>.md
+
+    Args:
+        title: Meeting-Titel
+        attendees: Liste der Teilnehmer (Pflicht laut Schema)
+        project: Optional Projekt-Slug
+        date: ISO-Datum (default heute)
+        location: Optional
+        duration: Optional, frei (z.B. "60min" oder "1h30")
+        body: Markdown-Body (Notizen, Decisions, etc.)
+        tags: Optional
+
+    Returns:
+        {path, id}
+    """
+    try:
+        if not attendees:
+            return {"error": "attendees ist Pflicht (Schema §2: meeting)"}
+        d = date or vault.today_iso()
+        slug = vault.slugify(title)
+        filename = f"{d}_{slug}.md"
+        if project:
+            rel = f"05_Projects/{project}/meetings/{filename}"
+        else:
+            rel = f"10_Life/meetings/{filename}"
+
+        try:
+            if vault.safe_path(rel).exists():
+                return {"error": f"Meeting existiert bereits: {rel}"}
+        except VaultError as e:
+            return {"error": str(e)}
+
+        meta: dict[str, Any] = {
+            "id": slug,
+            "type": "meeting",
+            "title": title,
+            "date": d,
+            "attendees": attendees,
+            "status": "draft",
+            "created": vault.today_iso(),
+            "updated": vault.today_iso(),
+            "tags": tags or [],
+        }
+        if project:
+            meta["project"] = project
+        if location:
+            meta["location"] = location
+        if duration:
+            meta["duration"] = duration
+
+        post = frontmatter.Post(body, **meta)
+        vault.write_post(rel, post)
+        return {"path": rel, "id": slug}
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+# ---------- Two-Step Delete ---------------------------------------------------
+# Pending deletes leben in-memory: Server-Restart cancelt alle pending deletes
+# (gewollt — sicheres Default-Verhalten, kein versehentlicher Stale-Delete).
+
+_pending_deletes: dict[str, dict[str, Any]] = {}
+
+
+@mcp.tool()
+def request_delete(path: str, reason: str = "") -> dict[str, Any]:
+    """Schritt 1 des Two-Step-Deletes: prüft ob Datei existiert und gibt
+    einen Confirmation-Token zurück. Datei wird NOCH NICHT gelöscht.
+
+    Args:
+        path: Rel-Pfad der zu löschenden Datei
+        reason: Optionaler Grund (für Logging)
+
+    Returns:
+        {confirm_token, path, preview, expires_in_seconds}
+        Token muss an confirm_delete übergeben werden um Löschung auszuführen.
+    """
+    try:
+        full = vault.safe_path(path)
+        if not full.is_file():
+            return {"error": f"Datei nicht gefunden: {path}"}
+        # Preview: erste 200 Zeichen + Größe
+        size = full.stat().st_size
+        try:
+            preview = full.read_text(encoding="utf-8")[:200].replace("\n", " ⏎ ")
+        except OSError:
+            preview = "(Binärdatei)"
+        # Token = Pfad-Hash + Timestamp (in-memory)
+        import secrets
+
+        token = secrets.token_urlsafe(8)
+        _pending_deletes[token] = {
+            "path": path,
+            "requested_at": vault.now_iso(),
+            "reason": reason,
+        }
+        return {
+            "confirm_token": token,
+            "path": path,
+            "size_bytes": size,
+            "preview": preview,
+            "reason": reason,
+            "next_step": f"confirm_delete(token='{token}') ausführen um zu löschen",
+        }
+    except VaultError as e:
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def confirm_delete(token: str) -> dict[str, Any]:
+    """Schritt 2 des Two-Step-Deletes: löscht die Datei für die der Token
+    via request_delete erstellt wurde.
+
+    Args:
+        token: confirm_token aus request_delete
+
+    Returns:
+        {deleted: true, path, requested_at}  oder {error}
+    """
+    pending = _pending_deletes.pop(token, None)
+    if not pending:
+        return {"error": f"Token unbekannt oder abgelaufen: {token}"}
+    try:
+        vault.delete_file(pending["path"])
+        return {
+            "deleted": True,
+            "path": pending["path"],
+            "requested_at": pending["requested_at"],
+            "reason": pending.get("reason", ""),
+        }
+    except VaultError as e:
+        # Bei Fehler Token wieder einsetzen damit Retry möglich ist
+        _pending_deletes[token] = pending
+        return {"error": str(e)}
+
+
 # ---------- Auth Middleware --------------------------------------------------
 
 
