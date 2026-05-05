@@ -1136,9 +1136,12 @@ def vault_lint(include_structural: bool = False) -> dict[str, Any]:
             or rel.endswith("/README.md")
             or rel == "README.md"
             or rel.endswith("/_index.md")
+            or rel.endswith("/CONTEXT.md")
             or rel == "CLAUDE.md"
             or rel.startswith("06_Meta/health-reports/")
             or rel.startswith("06_Meta/health_checks/")
+            or rel.startswith("06_Meta/bot-memory/")
+            or rel == "07_Tools/training/system_prompt.md"
             # Schema/Pipelines/MOC sind selbst Doku ohne id-Pflicht
             or rel in ("PIPELINES.md", "SCHEMA.md", "COMMANDS.md", "MOC.md")
             or rel.startswith("06_Meta/todo")
@@ -1147,6 +1150,18 @@ def vault_lint(include_structural: bool = False) -> dict[str, Any]:
             or rel.startswith("06_Meta/changelog")
             or rel.startswith("99_Archive/")
         )
+
+        # Code-Spans (`...`) und Code-Blöcke (```...```) entfernen bevor wir
+        # nach Wikilinks suchen — `[[link]]` in <code>-Tags / inline-Code ist
+        # literaler Text, kein echter Link.
+        code_block_re = _re.compile(r"```.*?```", _re.DOTALL)
+        inline_code_re = _re.compile(r"`[^`\n]+`")
+        html_code_re = _re.compile(r"<code>.*?</code>", _re.DOTALL | _re.IGNORECASE)
+        def strip_code(text: str) -> str:
+            text = code_block_re.sub("", text)
+            text = html_code_re.sub("", text)
+            text = inline_code_re.sub("", text)
+            return text
 
         # Placeholder-Wikilink-Erkennung: wenn der Target wie ein Doku-Beispiel
         # aussieht, ignorieren (single letter, < > braces, Spaces, Em-Dashes)
@@ -1189,14 +1204,16 @@ def vault_lint(include_structural: bool = False) -> dict[str, Any]:
             {"id": k, "paths": v} for k, v in id_to_paths.items() if len(v) > 1
         ]
 
-        # Broken wikilinks (Placeholder-Patterns ignorieren + Templates/Reports skip)
+        # Broken wikilinks (Placeholder-Patterns ignorieren + Templates/Reports skip
+        # + Code-Spans entfernen damit [[link]] in <code> nicht als Wikilink gilt)
         all_ids = set(id_to_paths.keys())
         broken_wikilinks: list[dict[str, Any]] = []
         for fd in files_data:
             if skip_path(fd["path"]):
                 continue
+            body_no_code = strip_code(fd["body"] or "")
             broken_in_file: set[str] = set()
-            for m in vault._WIKILINK_RE.finditer(fd["body"] or ""):
+            for m in vault._WIKILINK_RE.finditer(body_no_code):
                 target = m.group(1).strip()
                 if target and target not in all_ids and not is_placeholder(target):
                     broken_in_file.add(target)
