@@ -1095,16 +1095,27 @@ def daily_briefing(date: str | None = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def vault_lint() -> dict[str, Any]:
+def vault_lint(include_structural: bool = False) -> dict[str, Any]:
     """Vault-Schema-Linter — findet Drift und Inkonsistenzen.
 
-    Prüft:
+    Prüft (default smart-mode — Templates/READMEs werden gefiltert):
       - broken_wikilinks: [[id]] die auf nicht-existente IDs zeigen
       - duplicate_ids: gleiche FM-ID in mehreren Files
       - missing_fm: Files ohne YAML-Frontmatter
       - missing_required: Files mit fehlenden Pflichtfeldern (id, type, title)
       - context_drift: Tasks mit `context` ohne führendes @ (oder umgekehrt)
       - orphans: Notes ohne `[[id]]` Backlinks von anderen Files
+
+    Default-Filter (im Smart-Mode aus dem Scan ausgeschlossen):
+      - 08_Templates/* — Templates haben absichtlich keine FM-Werte
+      - **/README.md, **/_index.md — strukturelle Doku ohne Schema-Pflicht
+      - 06_Meta/health-reports/* — automatisch generierte Reports
+      - Placeholder-Pattern als wikilink-Targets (`<x>`, single-letter IDs,
+        IDs mit Spaces oder Em-Dashes — die sind oft Doku-Beispiele)
+
+    Args:
+        include_structural: Wenn True, ALLES scannen (auch Templates/READMEs/Reports).
+            Default False — nur "echte" Content-Files.
 
     Returns:
         Dictionary mit Listen pro Issue-Kategorie + Counts.
@@ -1118,6 +1129,33 @@ def vault_lint() -> dict[str, Any]:
         missing_fm: list[str] = []
         missing_required: list[dict[str, Any]] = []
 
+        # Filter-Functions im Smart-Mode
+        import re as _re
+        skip_path = lambda rel: not include_structural and (
+            rel.startswith("08_Templates/")
+            or rel.endswith("/README.md")
+            or rel == "README.md"
+            or rel.endswith("/_index.md")
+            or rel == "CLAUDE.md"
+            or rel.startswith("06_Meta/health-reports/")
+            or rel.startswith("06_Meta/health_checks/")
+            # Schema/Pipelines/MOC sind selbst Doku ohne id-Pflicht
+            or rel in ("PIPELINES.md", "SCHEMA.md", "COMMANDS.md", "MOC.md")
+            or rel.startswith("06_Meta/todo")
+            or rel.startswith("06_Meta/orphans")
+            or rel.startswith("06_Meta/stats")
+            or rel.startswith("06_Meta/changelog")
+            or rel.startswith("99_Archive/")
+        )
+
+        # Placeholder-Wikilink-Erkennung: wenn der Target wie ein Doku-Beispiel
+        # aussieht, ignorieren (single letter, < > braces, Spaces, Em-Dashes)
+        placeholder_re = _re.compile(
+            r"^([a-z]|<.*>|\.\.\.|.*\s.*|.*[—–].*|kebab-case-id|t-<slug>|wikilink|filename|"
+            r"konzept(-[ab])?|alt|neu|id|x|a|b)$"
+        )
+        is_placeholder = lambda target: bool(placeholder_re.match(target.lower())) or " " in target
+
         for path in all_md:
             try:
                 text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
@@ -1127,17 +1165,18 @@ def vault_lint() -> dict[str, Any]:
             try:
                 post = frontmatter.loads(text)
             except Exception:  # noqa: BLE001
-                missing_fm.append(rel)
+                if not skip_path(rel):
+                    missing_fm.append(rel)
                 continue
             fm = post.metadata
             if not fm:
-                missing_fm.append(rel)
+                if not skip_path(rel):
+                    missing_fm.append(rel)
                 continue
             fid = fm.get("id")
             ftype = fm.get("type")
-            ftitle = fm.get("title")
             missing_keys = [k for k in ["id", "type", "title"] if not fm.get(k)]
-            if missing_keys:
+            if missing_keys and not skip_path(rel):
                 missing_required.append({"path": rel, "missing": missing_keys})
             if fid:
                 id_to_paths.setdefault(str(fid), []).append(rel)
@@ -1150,14 +1189,16 @@ def vault_lint() -> dict[str, Any]:
             {"id": k, "paths": v} for k, v in id_to_paths.items() if len(v) > 1
         ]
 
-        # Broken wikilinks
+        # Broken wikilinks (Placeholder-Patterns ignorieren + Templates/Reports skip)
         all_ids = set(id_to_paths.keys())
         broken_wikilinks: list[dict[str, Any]] = []
         for fd in files_data:
+            if skip_path(fd["path"]):
+                continue
             broken_in_file: set[str] = set()
             for m in vault._WIKILINK_RE.finditer(fd["body"] or ""):
                 target = m.group(1).strip()
-                if target and target not in all_ids:
+                if target and target not in all_ids and not is_placeholder(target):
                     broken_in_file.add(target)
             if broken_in_file:
                 broken_wikilinks.append({
@@ -1179,13 +1220,15 @@ def vault_lint() -> dict[str, Any]:
                     "counts": {v: contexts_seen[v] for v in variants},
                 })
 
-        # Orphans (Notes/Meetings ohne Backlinks)
+        # Orphans (Notes/Meetings ohne Backlinks, Templates+Archive ausgenommen)
         referenced_ids: set[str] = set()
         for fd in files_data:
             for m in vault._WIKILINK_RE.finditer(fd["body"] or ""):
                 referenced_ids.add(m.group(1).strip())
         orphans: list[dict[str, Any]] = []
         for fd in files_data:
+            if skip_path(fd["path"]):
+                continue
             if fd["type"] in ("note", "meeting") and fd["id"] and str(fd["id"]) not in referenced_ids:
                 orphans.append({"path": fd["path"], "id": fd["id"], "type": fd["type"]})
 
@@ -1198,6 +1241,7 @@ def vault_lint() -> dict[str, Any]:
                 "missing_required": len(missing_required),
                 "context_drift": len(context_drift),
                 "orphans": len(orphans),
+                "scan_mode": "all" if include_structural else "smart (templates+readmes+reports skip)",
             },
             "broken_wikilinks": broken_wikilinks[:50],
             "duplicate_ids": duplicate_ids,
