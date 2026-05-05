@@ -32,7 +32,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-from ki_os_mcp import audit, snapshot, vault
+from ki_os_mcp import audit, maintain, snapshot, validators, vault
 from ki_os_mcp.ratelimit import RateLimitMiddleware
 from ki_os_mcp.vault import VaultError
 
@@ -295,10 +295,10 @@ def create_note(
         {path, id, created}
     """
     try:
+        # STRICT VALIDATOR
+        if err := validators.validate_create_note(title, project, body, tags, subpath):
+            return {"error": err}
         slug = vault.slugify(title)
-        slug_err = vault.validate_slug(slug)
-        if slug_err:
-            return {"error": f"Slug ungültig: {slug_err}"}
         date = vault.today_iso()
         filename = f"{date}_{slug}.md"
         if project:
@@ -376,14 +376,13 @@ def create_task(
         {path, id}
     """
     try:
-        if priority not in ("urgent", "high", "medium", "low"):
-            return {"error": f"Ungültige Priorität: {priority}"}
-        if recurrence is not None and recurrence not in ("daily", "weekdays", "weekly", "monthly"):
-            return {"error": f"Ungültige recurrence: {recurrence} (erlaubt: daily|weekdays|weekly|monthly)"}
+        # STRICT VALIDATOR
+        if err := validators.validate_create_task(title, priority, due, context, project, recurrence):
+            return {"error": err}
         slug = vault.slugify(title)
-        slug_err = vault.validate_slug(slug)
-        if slug_err:
-            return {"error": f"Slug ungültig: {slug_err}"}
+        # Context auto-normalisieren (kein @-Präfix)
+        if context:
+            context = context.lstrip("@").lower()
         task_id = f"t-{slug}"
         rel = f"10_Life/tasks/{slug}.md"
 
@@ -523,8 +522,9 @@ def task(
         {path, id, status, action_applied}
     """
     try:
-        if action not in ("done", "reopen", "snooze", "edit"):
-            return {"error": f"Unbekannte action: {action} (erlaubt: done|reopen|snooze|edit)"}
+        # STRICT VALIDATOR
+        if err := validators.validate_task_action(id, action, snooze_until, due, priority):
+            return {"error": err}
 
         task_path = vault.find_task(id)
         if not task_path:
@@ -596,13 +596,11 @@ def create_meeting(
         {path, id}
     """
     try:
-        if not attendees:
-            return {"error": "attendees ist Pflicht (Schema §2: meeting)"}
+        # STRICT VALIDATOR
+        if err := validators.validate_create_meeting(title, attendees, project, date):
+            return {"error": err}
         d = date or vault.today_iso()
         slug = vault.slugify(title)
-        slug_err = vault.validate_slug(slug)
-        if slug_err:
-            return {"error": f"Slug ungültig: {slug_err}"}
         filename = f"{d}_{slug}.md"
         if project:
             rel = f"05_Projects/{project}/meetings/{filename}"
@@ -1353,6 +1351,65 @@ def self_test() -> dict[str, Any]:
     }
 
 
+# ---------- Maintain-State (in-memory) -----------------------------------
+# Letzter Maintain-Run für Health-Endpoint + Anti-Spam (nicht 2× parallel)
+_last_maintain: dict[str, Any] = {
+    "started_at": None,
+    "finished_at": None,
+    "duration_ms": 0,
+    "status": "never",  # never | ok | error | running
+    "summary": {},
+}
+
+
+def _run_maintain_locked() -> dict[str, Any]:
+    """Wrapper: maintain.run_maintain mit Lock damit nicht parallel läuft."""
+    if _last_maintain["status"] == "running":
+        return {"skipped": "already_running"}
+    _last_maintain["status"] = "running"
+    _last_maintain["started_at"] = maintain.datetime.now().isoformat(timespec="seconds")
+    try:
+        report = maintain.run_maintain()
+        _last_maintain["finished_at"] = report["finished_at"]
+        _last_maintain["duration_ms"] = report["duration_ms"]
+        _last_maintain["summary"] = {
+            k: ("error" if isinstance(v, dict) and "error" in v else "ok")
+            for k, v in report.get("steps", {}).items()
+        }
+        _last_maintain["status"] = "ok" if all(
+            v == "ok" for v in _last_maintain["summary"].values()
+        ) else "error"
+        return report
+    except Exception as e:  # noqa: BLE001
+        _last_maintain["status"] = "error"
+        _last_maintain["summary"] = {"exception": str(e)}
+        log.error("maintain run failed: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+def vault_maintain() -> dict[str, Any]:
+    """Führt die komplette Vault-Self-Maintenance-Pipeline aus.
+
+    Pipeline-Schritte (idempotent, Errors werden gefangen):
+      1. Auto-Link alle Projekt-READMEs (Notes/Meetings)
+      2. Context-Drift normalisieren (@home → home in Tasks)
+      3. Daily-Backlinks: heute erstellte Items in heutige Daily-Note
+      4. Lint-Summary (was nicht auto-fixbar war)
+
+    Wird automatisch getriggert:
+      - Nach jedem Schreibvorgang (immediate, async)
+      - Periodisch alle 10 Minuten (background scheduler)
+      - Beim Server-Start (boot-run)
+
+    Plus jederzeit manuell via Tool-Call.
+
+    Returns:
+        Pipeline-Report mit pro-Schritt Status + Counts + Errors.
+    """
+    return _run_maintain_locked()
+
+
 @mcp.tool()
 def vault_autolink(dry_run: bool = False) -> dict[str, Any]:
     """Linkt automatisch alle Notes/Meetings unter 05_Projects/<slug>/ in deren
@@ -1535,6 +1592,12 @@ async def health(_: Request) -> JSONResponse:
             "uptime_seconds": int(_t.time() - _BOOT_TIME),
             "rate_limit_per_min": int(os.environ.get("MCP_RATE_LIMIT_PER_MIN", "60")),
             "snapshot_enabled": os.environ.get("MCP_SNAPSHOT_ENABLED", "1") not in ("0", "false", "no"),
+            "maintain": {
+                "status": _last_maintain["status"],
+                "last_run": _last_maintain["finished_at"],
+                "duration_ms": _last_maintain["duration_ms"],
+                "steps": _last_maintain["summary"],
+            },
         }
     )
 
@@ -1583,9 +1646,40 @@ def create_app() -> Starlette:
     async def lifespan(app: Starlette):
         audit.log_event("server_start", host=MCP_HOST, port=MCP_PORT,
                         auth=bool(_VALID_TOKENS), legacy=bool(MCP_TOKEN_LEGACY))
-        async with mcp_app.router.lifespan_context(app):
-            yield
-        audit.log_event("server_stop")
+
+        # Background-Scheduler: alle 10 Min Maintain + 1× beim Boot
+        async def maintain_loop():
+            import asyncio
+            # Boot-Run mit kleinem Delay damit Server vorher steht
+            await asyncio.sleep(15)
+            try:
+                log.info("maintain: boot run")
+                _run_maintain_locked()
+            except Exception as e:  # noqa: BLE001
+                log.error("maintain boot run failed: %s", e)
+            # Periodic-Loop
+            while True:
+                try:
+                    await asyncio.sleep(600)  # 10 Min
+                    log.info("maintain: periodic run")
+                    _run_maintain_locked()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:  # noqa: BLE001
+                    log.error("maintain periodic run failed: %s", e)
+
+        import asyncio
+        task = asyncio.create_task(maintain_loop())
+        try:
+            async with mcp_app.router.lifespan_context(app):
+                yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            audit.log_event("server_stop")
 
     app = Starlette(
         debug=False,
