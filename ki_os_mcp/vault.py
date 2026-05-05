@@ -156,6 +156,126 @@ def find_wikilink_refs(target_id: str) -> list[tuple[Path, list[int]]]:
     return out
 
 
+# ---------- Auto-Notes Block in Project-READMEs ------------------------------
+
+# Markers für auto-generierten Notes-Block in Projekt-READMEs.
+# Zwischen den Markern wird vom Server gepflegt; alles drumrum ist manueller
+# Content und bleibt unangetastet.
+AUTO_NOTES_START = "<!-- AUTO-NOTES-START -->"
+AUTO_NOTES_END = "<!-- AUTO-NOTES-END -->"
+
+
+def update_auto_notes_block(readme_path: Path, sections: dict[str, list[dict[str, str]]]) -> bool:
+    """Updated den Auto-Notes-Block in einem README.
+
+    Args:
+        readme_path: absoluter Pfad zur README.md
+        sections: dict {section_label: [{"id": "...", "title": "...", "date": "..."}]}
+                  z.B. {"Notes": [...], "Meetings": [...]}
+
+    Returns:
+        True wenn das File geändert wurde.
+
+    Erstellt Block falls nicht vorhanden (am Ende des Files).
+    """
+    if not readme_path.is_file():
+        return False
+    text = readme_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+
+    # Auto-Block bauen
+    lines = [AUTO_NOTES_START, ""]
+    has_content = False
+    for label, items in sections.items():
+        if not items:
+            continue
+        has_content = True
+        lines.append(f"## {label}")
+        lines.append("")
+        # Sortieren: nach Datum absteigend
+        items_sorted = sorted(items, key=lambda x: x.get("date", ""), reverse=True)
+        for item in items_sorted:
+            date = item.get("date", "")
+            date_prefix = f"`{date}` " if date else ""
+            lines.append(f"- {date_prefix}[[{item['id']}|{item['title']}]]")
+        lines.append("")
+    lines.append(AUTO_NOTES_END)
+
+    if not has_content:
+        # Leerer Block: trotzdem mit Markern (idempotent für nächsten Run)
+        new_block = f"{AUTO_NOTES_START}\n{AUTO_NOTES_END}"
+    else:
+        new_block = "\n".join(lines)
+
+    if AUTO_NOTES_START in text and AUTO_NOTES_END in text:
+        # Existing block ersetzen
+        before = text.split(AUTO_NOTES_START)[0].rstrip()
+        after = text.split(AUTO_NOTES_END)[1].lstrip()
+        new_text = before + "\n\n" + new_block + ("\n\n" + after if after else "\n")
+    else:
+        # Append am Ende
+        new_text = text.rstrip() + "\n\n" + new_block + "\n"
+
+    if new_text == text:
+        return False
+    readme_path.write_text(new_text, encoding="utf-8")
+    return True
+
+
+def collect_project_content(project_slug: str) -> dict[str, list[dict[str, str]]]:
+    """Sammelt alle Notes + Meetings unter 05_Projects/<slug>/.
+
+    Returns: {"Notes": [...], "Meetings": [...]}
+    """
+    project_dir = VAULT_PATH / "05_Projects" / project_slug
+    sections: dict[str, list[dict[str, str]]] = {"Notes": [], "Meetings": []}
+    if not project_dir.is_dir():
+        return sections
+
+    # Notes-Subfolder
+    for sub in ("notes", "meetings"):
+        sub_dir = project_dir / sub
+        if not sub_dir.is_dir():
+            continue
+        label = "Notes" if sub == "notes" else "Meetings"
+        for path in sorted(sub_dir.glob("*.md")):
+            try:
+                post = read_post(rel_path(path))
+            except Exception:  # noqa: BLE001
+                continue
+            fm = post.metadata
+            if not fm.get("id"):
+                continue
+            sections[label].append({
+                "id": str(fm["id"]),
+                "title": str(fm.get("title", path.stem)),
+                "date": str(fm.get("date", fm.get("created", ""))),
+            })
+
+    # Top-level Files (z.B. dashboard.md, stundenaufzeichnung.md)
+    top_level = []
+    for path in sorted(project_dir.glob("*.md")):
+        if path.name.lower() in ("readme.md", "context.md"):
+            continue
+        try:
+            post = read_post(rel_path(path))
+        except Exception:  # noqa: BLE001
+            continue
+        fm = post.metadata
+        if not fm.get("id"):
+            continue
+        ftype = fm.get("type", "note")
+        if ftype in ("note", "meeting"):
+            top_level.append({
+                "id": str(fm["id"]),
+                "title": str(fm.get("title", path.stem)),
+                "date": str(fm.get("date", fm.get("created", ""))),
+            })
+    if top_level:
+        sections.setdefault("Sonstige", []).extend(top_level)
+
+    return sections
+
+
 def find_related_refs(target_id: str) -> list[Path]:
     """Findet alle .md-Files die `target_id` in ihrer Frontmatter
     `related[]`-Liste haben (egal ob auch im Body verlinkt oder nicht).
