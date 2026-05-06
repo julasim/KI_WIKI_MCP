@@ -499,3 +499,20 @@ def _create_daily_skeleton(rel: str) -> None:
     p = safe_path(rel)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("---\n" + yaml.safe_dump(fm, allow_unicode=True, sort_keys=True) + "---\n" + body, encoding="utf-8")
+
+
+# ---------- 5y-Goal-Pfad-Konstanten ------------------------------------------
+# Single Source of Truth für alle Reader die unter 10_Life/goals/5y-2031/
+# liegen (vision, säulen, drift, tracker/habits etc.).
+
+GOAL_SLUG = "5y-2031"
+
+
+def goal_base() -> Path:
+    """Absoluter Pfad zum 5y-Goal-Folder (10_Life/goals/5y-2031/)."""
+    return VAULT_PATH / "10_Life" / "goals" / GOAL_SLUG
+
+
+def goal_file(*parts: str) -> Path:
+    """Pfad innerhalb des 5y-Goal-Folders."""
+    return goal_base().joinpath(*parts)

@@ -1116,6 +1116,363 @@ def daily_briefing(date: str | None = None) -> dict[str, Any]:
         return {"error": str(e)}
 
 
+# ============================================================================
+# READ-TOOLS für 5y-Goal-Tracker (Vision, Säulen, Drift, Habits, Sport, ...)
+# ============================================================================
+# Alle Reader spiegeln das Format das Dashboard `lib/vault.ts` heute selbst
+# berechnet, damit Bot + Dashboard ein 1:1-Replace machen können.
+
+# Habit-Spalten in der Reihenfolge wie sie in tracker/habits.md stehen.
+# Muss SYNC bleiben mit dashboard/lib/vault.ts HABIT_KEYS.
+HABIT_KEYS = [
+    {"key": "sport", "label": "Sport", "target": "3-5 km"},
+    {"key": "lesen", "label": "Lesen", "target": "30 min"},
+    {"key": "schlaf", "label": "Schlaf", "target": "7+ h"},
+    {"key": "bildschirm", "label": "Bildschirm", "target": "< 22:30"},
+    {"key": "vision", "label": "Vision", "target": "1× lesen"},
+    {"key": "wasser", "label": "Wasser", "target": "2 L"},
+]
+
+
+def _read_goal_text(*parts: str) -> str | None:
+    """Liest Datei unter 10_Life/goals/5y-2031/<parts>. None wenn fehlt."""
+    p = vault.goal_file(*parts)
+    if not p.is_file():
+        return None
+    try:
+        return p.read_text(encoding="utf-8").replace("\r\n", "\n")
+    except OSError:
+        return None
+
+
+@mcp.tool()
+def read_vision() -> dict[str, Any]:
+    """Liest den Manifesto-Block aus 10_Life/goals/5y-2031/vision.md.
+
+    Format: erstes Blockquote mit Bold (`> **...**`).
+    Output: {text: str, found: bool}
+    """
+    raw = _read_goal_text("vision.md")
+    if raw is None:
+        return {"text": "", "found": False, "reason": "vision.md nicht gefunden"}
+    import re as _re
+    m = _re.search(r">\s*\*\*([\s\S]+?)\*\*", raw)
+    if not m:
+        return {"text": "", "found": False, "reason": "kein Manifesto-Block im File"}
+    text = _re.sub(r"\s+", " ", _re.sub(r"\n>\s*", " ", m.group(1))).strip()
+    return {"text": text, "found": True}
+
+
+@mcp.tool()
+def read_saeulen() -> dict[str, Any]:
+    """Liest die Säulen-Tabelle aus 10_Life/goals/5y-2031/readme.md.
+
+    Tabellenkopf: | Säule | Status | Nächster Anker | ...
+    Output: {saeulen: [{slug, label, status, kpi, drift, note}, ...], total}
+    """
+    raw = _read_goal_text("readme.md")
+    if raw is None:
+        return {"saeulen": [], "total": 0, "reason": "readme.md nicht gefunden"}
+    import re as _re
+    m = _re.search(
+        r"\|\s*Säule\s*\|\s*Status\s*\|\s*Nächster Anker\s*\|[^\n]*\n((?:\|[^\n]*\|\n)+)",
+        raw,
+    )
+    if not m:
+        return {"saeulen": [], "total": 0, "reason": "Säulen-Tabelle nicht gefunden"}
+    out: list[dict[str, Any]] = []
+    for row in m.group(1).strip().split("\n"):
+        cells = [c.strip() for c in row.split("|")[1:-1]]
+        if len(cells) < 2:
+            continue
+        if all(_re.fullmatch(r"-+", c or "") for c in cells):
+            continue  # Header-Separator
+        out.append({
+            "slug": cells[0].lower(),
+            "label": cells[0],
+            "status": "info",
+            "kpi": cells[1] if len(cells) > 1 else "",
+            "drift": 0,
+            "note": cells[2] if len(cells) > 2 else "",
+        })
+    return {"saeulen": out, "total": len(out)}
+
+
+@mcp.tool()
+def read_drift() -> dict[str, Any]:
+    """Liest Drift-Anker (weekly/monthly/quarterly) aus readme.md.
+
+    Pattern: `**Letzter Wochen-Anker:** YYYY-MM-DD` (oder `—`).
+    Output: {weekly, monthly, quarterly} — fehlende Keys absent.
+    """
+    raw = _read_goal_text("readme.md")
+    if raw is None:
+        return {"reason": "readme.md nicht gefunden"}
+    import re as _re
+    out: dict[str, Any] = {}
+    for label, key in (
+        ("Letzter Wochen-Anker", "weekly"),
+        ("Letzter Monats-Anker", "monthly"),
+        ("Letzter Quartals-Anker", "quarterly"),
+    ):
+        m = _re.search(rf"\*\*{label}:\*\*\s*([\d-]+|—)", raw)
+        if m:
+            out[key] = m.group(1)
+    return out
+
+
+@mcp.tool()
+def read_habits(days: int = 30) -> dict[str, Any]:
+    """Liest Habit-Tabelle aus tracker/habits.md.
+
+    Format pro Zeile: `| YYYY-MM-DD | ✓/✗/- | ✓/✗/- | ... |`
+    Spalten in Reihenfolge: Sport, Lesen, Schlaf, Bildschirm, Vision, Wasser.
+    Mapping: ✓=ok, ✗=bad, sonst=skip.
+
+    Args:
+        days: Anzahl Tage zurück inkl. heute (default 30, max 365)
+
+    Returns:
+        {habits: [{date, values: {sport, lesen, ...}}, ...], keys: [...], total}
+    """
+    days = max(1, min(int(days), 365))
+    raw = _read_goal_text("tracker", "habits.md")
+    if raw is None:
+        return {"habits": [], "keys": HABIT_KEYS, "total": 0,
+                "reason": "habits.md nicht gefunden"}
+    import re as _re
+    rows: dict[str, dict[str, str]] = {}
+    for line in raw.split("\n"):
+        m = _re.match(r"^\|\s*(\d{4}-\d{2}-\d{2})\s*\|(.+)\|$", line)
+        if not m:
+            continue
+        cells = [c.strip() for c in m.group(2).split("|")]
+        values: dict[str, str] = {}
+        for i, h in enumerate(HABIT_KEYS):
+            c = cells[i] if i < len(cells) else ""
+            values[h["key"]] = "ok" if c == "✓" else "bad" if c == "✗" else "skip"
+        rows[m.group(1)] = values
+
+    from datetime import date as _date, timedelta
+    today = _date.today()
+    out: list[dict[str, Any]] = []
+    for i in range(days - 1, -1, -1):
+        d = (today - timedelta(days=i)).isoformat()
+        out.append({"date": d, "values": rows.get(d, {})})
+    return {"habits": out, "keys": HABIT_KEYS, "total": len(out)}
+
+
+@mcp.tool()
+def read_sport(limit: int | None = None) -> dict[str, Any]:
+    """Liest Sport-Sessions aus tracker/sport-log.md.
+
+    Tabellen-Format: | YYYY-MM-DD | cardio|kraft | dauer_min | notiz |
+    Sortiert nach Datum absteigend (neueste zuerst).
+
+    Args:
+        limit: max Anzahl Sessions (None = alle)
+
+    Returns:
+        {sessions: [{date, art, dauer, notiz}, ...], total}
+    """
+    raw = _read_goal_text("tracker", "sport-log.md")
+    if raw is None:
+        return {"sessions": [], "total": 0, "reason": "sport-log.md nicht gefunden"}
+    import re as _re
+    out: list[dict[str, Any]] = []
+    for line in raw.split("\n"):
+        m = _re.match(
+            r"^\|\s*(\d{4}-\d{2}-\d{2})\s*\|\s*(cardio|kraft)\s*\|\s*(\d+)\s*\|\s*(.*?)\s*\|$",
+            line,
+        )
+        if not m:
+            continue
+        out.append({
+            "date": m.group(1),
+            "art": m.group(2),
+            "dauer": int(m.group(3)),
+            "notiz": m.group(4),
+        })
+    out.sort(key=lambda s: s["date"], reverse=True)
+    if limit is not None:
+        out = out[: max(0, int(limit))]
+    return {"sessions": out, "total": len(out)}
+
+
+@mcp.tool()
+def read_books() -> dict[str, Any]:
+    """Liest Bücher aus tracker/lesen.md (3 Sektionen: Aktiv/Geplant/Abgeschlossen).
+
+    Aktiv/Abgeschlossen sind Markdown-Tabellen mit
+    `| # | Titel | Autor | ... | Start | Ende | Lesson |`.
+    Geplant ist eine Bullet-Liste `- *Titel* — Autor`.
+
+    Output: {books: [{num?, title, author?, status, start?, ende?, lesson?}, ...], total}
+    """
+    raw = _read_goal_text("tracker", "lesen.md")
+    if raw is None:
+        return {"books": [], "total": 0, "reason": "lesen.md nicht gefunden"}
+    import re as _re
+    out: list[dict[str, Any]] = []
+    sections = _re.split(r"^##\s+", raw, flags=_re.MULTILINE)
+    for section in sections:
+        title_m = _re.match(r"^(Aktiv|Geplant|Abgeschlossen)", section, _re.IGNORECASE)
+        if not title_m:
+            continue
+        status = title_m.group(1).lower()
+        if status == "geplant":
+            for line in section.split("\n"):
+                bm = _re.match(r"^-\s+\*?(.+?)\*?\s*(?:—|-)\s*(.+?)$", line)
+                if bm:
+                    out.append({
+                        "title": bm.group(1).strip(),
+                        "author": bm.group(2).strip(),
+                        "status": "geplant",
+                    })
+            continue
+        for line in section.split("\n"):
+            if not line.startswith("|") or "---" in line:
+                continue
+            cells = [c.strip() for c in line.split("|")[1:-1]]
+            if len(cells) < 2 or not cells[0] or cells[0] == "#":
+                continue
+            try:
+                num: int | None = int(cells[0])
+            except ValueError:
+                num = None
+            book: dict[str, Any] = {
+                "title": (cells[1] if len(cells) > 1 else cells[0]) or "(?)",
+                "status": status,
+            }
+            if num is not None:
+                book["num"] = num
+            if len(cells) > 2 and cells[2]:
+                book["author"] = cells[2]
+            if len(cells) > 4 and cells[4]:
+                book["start"] = cells[4]
+            if len(cells) > 5 and cells[5]:
+                book["ende"] = cells[5]
+            if cells[-1]:
+                book["lesson"] = cells[-1]
+            out.append(book)
+    return {"books": out, "total": len(out)}
+
+
+@mcp.tool()
+def read_wins(days: int | None = None) -> dict[str, Any]:
+    """Liest Wins aus tracker/wins.md.
+
+    Format: `## YYYY-MM-DD\\n- Win-Text\\n- ...` (mehrere Datums-Sektionen).
+
+    Args:
+        days: nur letzte N Tage (None = alle)
+
+    Returns:
+        {wins: [{date, saeule|null, text}, ...], total, by_date: {YYYY-MM-DD: count}}
+    """
+    raw = _read_goal_text("tracker", "wins.md")
+    if raw is None:
+        return {"wins": [], "total": 0, "by_date": {}, "reason": "wins.md nicht gefunden"}
+    import re as _re
+    out: list[dict[str, Any]] = []
+    current_date: str | None = None
+    for line in raw.split("\n"):
+        dm = _re.match(r"^##\s+(\d{4}-\d{2}-\d{2})", line)
+        if dm:
+            current_date = dm.group(1)
+            continue
+        if not current_date:
+            continue
+        bm = _re.match(r"^-\s+(.+)", line)
+        if bm:
+            out.append({"date": current_date, "saeule": None, "text": bm.group(1).strip()})
+
+    if days is not None:
+        from datetime import date as _date, timedelta
+        cutoff = (_date.today() - timedelta(days=int(days))).isoformat()
+        out = [w for w in out if w["date"] >= cutoff]
+
+    by_date: dict[str, int] = {}
+    for w in out:
+        by_date[w["date"]] = by_date.get(w["date"], 0) + 1
+    return {"wins": out, "total": len(out), "by_date": by_date}
+
+
+@mcp.tool()
+def compute_streak() -> dict[str, Any]:
+    """Berechnet Habit-Streak (current + best) aus tracker/habits.md.
+
+    Definition: ein Tag zählt als "ok" wenn mind. 1 Habit `✓` ist.
+    Lookback: letzte 180 Tage (best-streak innerhalb dieses Fensters).
+
+    Output: {current: int, best: int, days_evaluated: int}
+    """
+    res = read_habits(180)  # type: ignore[no-untyped-call]
+    habits: list[dict[str, Any]] = res.get("habits", [])
+    best = 0
+    run = 0
+    for day in habits:
+        any_ok = any(v == "ok" for v in day["values"].values())
+        if any_ok:
+            run += 1
+            if run > best:
+                best = run
+        else:
+            run = 0
+    current = 0
+    for day in reversed(habits):
+        any_ok = any(v == "ok" for v in day["values"].values())
+        if any_ok:
+            current += 1
+        else:
+            break
+    return {"current": current, "best": best, "days_evaluated": len(habits)}
+
+
+@mcp.tool()
+def read_reminders() -> dict[str, Any]:
+    """Liest 06_Meta/reminders.json (vom Bot gepflegte Reminder-Liste).
+
+    Output: {reminders: [{id, fire_at, message, recurrence?}, ...], total}
+    """
+    p = vault.VAULT_PATH / "06_Meta" / "reminders.json"
+    if not p.is_file():
+        return {"reminders": [], "total": 0, "reason": "reminders.json nicht gefunden"}
+    import json as _json
+    try:
+        data = _json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        return {"reminders": [], "total": 0, "error": f"Parse-Fehler: {e}"}
+    if not isinstance(data, list):
+        return {"reminders": [], "total": 0, "error": "Erwarte JSON-Array"}
+    return {"reminders": data, "total": len(data)}
+
+
+@mcp.tool()
+def read_yesterday_daily() -> dict[str, Any]:
+    """Liest Frontmatter der gestrigen Daily-Note (für Recap auf Heute-Page).
+
+    Output: {found, date, energy?, mood?, key_insight?}
+    """
+    from datetime import date as _date, timedelta
+    yest = (_date.today() - timedelta(days=1)).isoformat()
+    rel = f"10_Life/daily/{yest}.md"
+    p = vault.safe_path(rel)
+    if not p.is_file():
+        return {"found": False, "date": yest}
+    try:
+        post = vault.read_post(rel)
+    except VaultError as e:
+        return {"found": False, "date": yest, "error": str(e)}
+    fm = post.metadata
+    out: dict[str, Any] = {"found": True, "date": yest}
+    for k in ("energy", "mood", "key_insight"):
+        v = fm.get(k)
+        if v is not None:
+            out[k] = v
+    return out
+
+
 @mcp.tool()
 def vault_lint(include_structural: bool = False) -> dict[str, Any]:
     """Vault-Schema-Linter — findet Drift und Inkonsistenzen.
