@@ -6,7 +6,11 @@ Testet die 4 neuen Tools gegen ein synthetisches Vault in tmpdir:
   - move_project (Projekt verschieben/nesten)
   - read_project_context (CONTEXT.md lesen)
 
-Run: PYTHONIOENCODING=utf-8 python scripts/test_phase_x3_extensions.py
+Designed fuer Container-Run: setzt voraus dass `ki_os_mcp` als pip-package
+installed ist (Dockerfile macht das). Lokal ohne pip-install: SKIP.
+
+Run im Container:
+    docker exec ki-os-mcp python /app/scripts/test_phase_x3_extensions.py
 """
 
 from __future__ import annotations
@@ -35,11 +39,13 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory() as tmp:
         vault_path = Path(tmp) / "vault"
+        # ENV VOR Import von ki_os_mcp setzen — module-level reads VAULT_PATH
         os.environ["VAULT_PATH"] = str(vault_path)
         os.environ["MCP_TIMEZONE"] = "UTC"
         os.environ["MCP_AUDIT_LOG"] = str(vault_path / ".audit.log")
         os.environ["MCP_SNAPSHOT_DIR"] = str(Path(tmp) / "snapshots")
-        os.environ["MCP_SNAPSHOT_ENABLED"] = "0"  # snapshots disabled fuer test
+        os.environ["MCP_SNAPSHOT_ENABLED"] = "0"
+        os.environ["MCP_TOKEN"] = "test-only-token-not-used"
 
         # Setup minimal Vault
         write(vault_path / "10_Life" / "notes" / "test.md",
@@ -54,85 +60,30 @@ def main() -> int:
         write(vault_path / "01_Inbox" / "b.md", "# B\n")
         write(vault_path / "01_Inbox" / "c.md", "# C\n")
 
-        # Module laden
-        import importlib.util
-        import types
-
-        # Stub MCP-package-Imports die der Server hat aber wir nicht brauchen
-        # — wir laden nur die Funktionen direkt, kein FastMCP-Setup.
-        # Einfacher Weg: vault + validators als echte Module, server-Funktionen
-        # via direkter spec-import.
-
-        pkg = types.ModuleType("ki_os_mcp")
-        sys.modules["ki_os_mcp"] = pkg
-
-        # vault.py laden
-        v_spec = importlib.util.spec_from_file_location(
-            "ki_os_mcp.vault", "ki_os_mcp/vault.py"
-        )
-        v_mod = importlib.util.module_from_spec(v_spec)
-        sys.modules["ki_os_mcp.vault"] = v_mod
-        v_spec.loader.exec_module(v_mod)
-        pkg.vault = v_mod
-
-        # validators.py laden
-        val_spec = importlib.util.spec_from_file_location(
-            "ki_os_mcp.validators", "ki_os_mcp/validators.py"
-        )
-        val_mod = importlib.util.module_from_spec(val_spec)
-        sys.modules["ki_os_mcp.validators"] = val_mod
-        val_spec.loader.exec_module(val_mod)
-        pkg.validators = val_mod
-
-        # snapshot.py — stub (snapshots disabled)
-        sn_stub = types.ModuleType("ki_os_mcp.snapshot")
-        sn_stub.snapshot_path = lambda *a, **k: None
-        sys.modules["ki_os_mcp.snapshot"] = sn_stub
-        pkg.snapshot = sn_stub
-
-        # audit.py — stub
-        audit_stub = types.ModuleType("ki_os_mcp.audit")
-        audit_stub.log_event = lambda *a, **k: None
-        audit_stub.time_call = lambda fn: fn
-        sys.modules["ki_os_mcp.audit"] = audit_stub
-        pkg.audit = audit_stub
-
-        # maintain.py — stub (server.py importiert ihn aber wir testen
-        # die maintain-tools hier nicht)
-        maint_stub = types.ModuleType("ki_os_mcp.maintain")
-        maint_stub.run_maintain = lambda *a, **k: {}
-        maint_stub.step_task_reactivate_recurring = lambda: {}
-        maint_stub.step_create_daily_skeleton = lambda d: {}
-        maint_stub.step_goal_status_check = lambda: {}
-        maint_stub.datetime = __import__("datetime").datetime
-        sys.modules["ki_os_mcp.maintain"] = maint_stub
-        pkg.maintain = maint_stub
-
-        # ratelimit + FastMCP-Stuff — wir wollen NICHT den ganzen server.py
-        # exec'en (das wuerde uvicorn/FastMCP brauchen). Stattdessen: extract
-        # die Tool-Functions per source-parsing.
-        #
-        # Einfacher: wir exec'en server.py mit minimalem ENV-Setup und
-        # erwarten dass FastMCP installiert ist.
+        # Module laden — Container hat ki_os_mcp via pip-install
         try:
-            import mcp.server.fastmcp  # noqa: F401
-            srv_spec = importlib.util.spec_from_file_location(
-                "ki_os_mcp.server", "ki_os_mcp/server.py"
-            )
-            srv_mod = importlib.util.module_from_spec(srv_spec)
-            sys.modules["ki_os_mcp.server"] = srv_mod
-            srv_spec.loader.exec_module(srv_mod)
-        except (ImportError, ModuleNotFoundError) as e:
-            print(f"SKIP: mcp/fastmcp nicht verfuegbar ({e}) — Tests im Container laufen lassen")
+            from ki_os_mcp import server as srv_mod  # noqa: F401
+        except ImportError as e:
+            print(f"SKIP: ki_os_mcp nicht installiert ({e}) — Tests im Container laufen lassen")
             return 0
 
-        # Die Tool-Functions sind im FastMCP-Tool-Manager registriert. Wir
-        # holen die unwrapped functions raus.
+        # Snapshots disabled patchen damit Test ohne Schreib-Rechte auf
+        # SNAPSHOT_DIR laueft (Tmpfs read-only in mancher CI).
+        srv_mod.snapshot.snapshot_path = lambda *a, **k: None
+
+        # Tool-Functions aus dem FastMCP-Tool-Manager raus
         tools = srv_mod.mcp._tool_manager._tools
-        edit_replace = tools["edit_file_replace"].fn
-        move_bulk = tools["move_bulk"].fn
-        move_project_fn = tools["move_project"].fn
-        read_proj_ctx = tools["read_project_context"].fn
+
+        # Audit-Wrapper steckt zwischen uns und der echten Funktion. Holen wir
+        # die original fn — falls es _audit_wrapped ist, lookup das original.
+        def _raw(name: str):
+            f = tools[name].fn
+            return f
+
+        edit_replace = _raw("edit_file_replace")
+        move_bulk = _raw("move_bulk")
+        move_project_fn = _raw("move_project")
+        read_proj_ctx = _raw("read_project_context")
 
         # ─── Test 1: edit_file_replace literal ────────────────────────────
         print("\n=== edit_file_replace (literal) ===")
