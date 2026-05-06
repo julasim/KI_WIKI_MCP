@@ -30,11 +30,8 @@ import os
 import re
 import time
 from datetime import date, datetime, timedelta
-from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
-
-import frontmatter
 
 from ki_os_mcp import audit, vault
 

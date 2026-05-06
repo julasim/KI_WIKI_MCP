@@ -477,6 +477,8 @@ def append_to_daily(
     Returns:
         {path, section}
     """
+    if err := validators.validate_append_to_daily(text, section, date):
+        raise ToolError(err)
     try:
         rel = vault.append_to_daily(text, section=section, d=date)
         return {"path": rel, "section": section}
@@ -509,6 +511,8 @@ def edit_file(
     Returns:
         {path, frontmatter, body_preview} mit dem geupdatetem Stand
     """
+    if err := validators.validate_edit_file(path, frontmatter_updates, body):
+        raise ToolError(err)
     try:
         # Snapshot vorher (nur wenn body geändert wird oder destruktive FM-Ops)
         before_bytes = vault.safe_path(path).read_bytes()
@@ -807,6 +811,8 @@ def move(
          wikilinks_updated: [{path, replacements}, ...],
          (dry_run: true falls nur Preview)}
     """
+    if err := validators.validate_move(source, dest):
+        raise ToolError(err)
     try:
         src = vault.safe_path(source)
         if not src.is_file():
@@ -814,8 +820,6 @@ def move(
         dst = vault.safe_path(dest)
         if dst.exists():
             raise ToolError(f"Zieldatei existiert bereits: {dest}")
-        if src == dst:
-            raise ToolError("source und dest sind identisch")
 
         # ID-Berechnung nur für .md
         old_id: str | None = None
@@ -982,6 +986,8 @@ def goal_log(
     Returns:
         {path, appended}
     """
+    if err := validators.validate_goal_log(goal, text, subtype):
+        raise ToolError(err)
     try:
         d = date or vault.today_iso()
         rel = f"10_Life/goals/{goal}/{subtype}.md"
@@ -1038,6 +1044,8 @@ def project_context(
     Returns:
         {path, mode}
     """
+    if err := validators.validate_project_context(project, text, mode):
+        raise ToolError(err)
     try:
         if mode not in ("append", "replace"):
             raise ToolError(f"mode muss 'append' oder 'replace' sein, nicht {mode}")
@@ -1910,20 +1918,15 @@ def vault_autolink(dry_run: bool = False) -> dict[str, Any]:
                 continue
 
             if dry_run:
-                # Würde aktualisiert?
-                current = readme.read_text(encoding="utf-8")
-                # Trick: mit den gleichen sections rendern, vergleichen
-                # (simulate ohne write)
-                from io import StringIO
-                # Simple-Check: existiert schon ein AUTO-Block? Wenn ja vermutlich up-to-date,
-                # aber wir markieren ihn trotzdem als "would-update" zur Sichtbarkeit.
-                would_change = True  # konservativ
+                # Konservativ: jeder Project-Folder zaehlt als "would_change".
+                # Echtes Diff-vs-Renderresult ist Aufwand fuer wenig Mehrwert in
+                # einem dry-run-Modus der eh nur diagnostisch ist.
                 updated.append({
                     "project": project_dir.name,
                     "notes": len(sections.get("Notes", [])),
                     "meetings": len(sections.get("Meetings", [])),
                     "other": len(sections.get("Sonstige", [])),
-                    "would_change": would_change,
+                    "would_change": True,
                 })
             else:
                 changed = vault.update_auto_notes_block(readme, sections)
