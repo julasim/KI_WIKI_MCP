@@ -1308,6 +1308,140 @@ def goal_log(
         raise ToolError(str(e))
 
 
+# ---------- create_project: Projekt-Container anlegen ------------------------
+
+
+@mcp.tool()
+def create_project(
+    name: str,
+    description: str | None = None,
+    parent: str | None = None,
+    tags: list[str] | None = None,
+) -> dict[str, Any]:
+    """Legt einen neuen Projekt-Container unter 05_Projects/<slug>/ an.
+
+    Erstellt:
+      - Ordner 05_Projects/<slug>/ (oder unter <parent>/<slug>/ als Subprojekt)
+      - README.md mit Frontmatter (id=project-<slug>, type=project, status=active)
+        plus Dataview-Queries fuer offene Tasks/Notes/Meetings die `project: <slug>`
+        in der Frontmatter haben.
+      - CONTEXT.md leeres Skeleton — kann via project_context() befuellt werden.
+
+    Args:
+        name: Projekt-Name (Anzeige-Titel, wird zu slug konvertiert)
+        description: Optional Beschreibungstext fuer README-Kopf (default Standard-Phrase)
+        parent: Optional Slug eines existierenden Projekts → Subprojekt
+        tags: Optional Tag-Liste fuer Frontmatter
+
+    Idempotent gegen Doppel-Anlagen: wenn Slug schon irgendwo unter
+    05_Projects/ existiert (rekursiv), wird abgebrochen.
+
+    Returns:
+        {slug, path, id, parent?, status='created'}
+    """
+    if err := validators.validate_create_project(name, parent):
+        raise ToolError(err)
+
+    slug = vault.slugify(name)
+    if not slug or slug == "untitled":
+        raise ToolError(f"Slug aus {name!r} nicht ableitbar — aussagekraeftigeren Namen waehlen")
+
+    # Existenz-Check rekursiv (verhindert Doppel-Slug an verschiedenen Orten)
+    existing = _find_project_dir(slug)
+    if existing is not None:
+        rel = vault.rel_path(existing)
+        return {
+            "slug": slug,
+            "path": rel,
+            "id": f"project-{slug}",
+            "status": "exists",
+            "reason": f"Projekt existiert bereits: {rel}/",
+        }
+
+    # Parent aufloesen falls Subprojekt
+    projects_root = vault.VAULT_PATH / "05_Projects"
+    projects_root.mkdir(parents=True, exist_ok=True)
+
+    if parent:
+        parent_dir = _find_project_dir(parent)
+        if parent_dir is None:
+            raise ToolError(f"Parent-Projekt {parent!r} nicht gefunden (oder mehrdeutig)")
+        proj_dir = parent_dir / slug
+    else:
+        proj_dir = projects_root / slug
+
+    proj_dir.mkdir(parents=True, exist_ok=False)
+
+    today = vault.today_iso()
+    desc = description.strip() if description and description.strip() else (
+        f"Projekt-Container fuer **{name}**. Tasks/Notes/Meetings mit "
+        f"`project: {slug}` im Frontmatter werden hier automatisch gelistet."
+    )
+
+    # README mit Dataview-Queries — gleiche Struktur wie Bot's alte create_project
+    body = (
+        f"# {name}\n\n"
+        f"{desc}\n\n"
+        f"## Status\n"
+        f"- **Status**: active\n"
+        f"- **Gestartet**: {today}\n\n"
+        f"## Offene Tasks\n"
+        f"```dataview\n"
+        f"TABLE WITHOUT ID file.link AS Task, priority AS Prio, due AS Faellig\n"
+        f'FROM "10_Life/tasks"\n'
+        f'WHERE project = "{slug}" AND status != "done" AND status != "cancelled"\n'
+        f"SORT priority DESC, due ASC\n"
+        f"```\n\n"
+        f"## Notizen\n"
+        f"```dataview\n"
+        f"LIST\n"
+        f'FROM "10_Life/notes"\n'
+        f'WHERE project = "{slug}"\n'
+        f"SORT file.ctime DESC\n"
+        f"```\n\n"
+        f"## Meetings\n"
+        f"```dataview\n"
+        f"TABLE WITHOUT ID file.link AS Meeting, date AS Datum\n"
+        f'FROM "10_Life/meetings"\n'
+        f'WHERE project = "{slug}"\n'
+        f"SORT date DESC\n"
+        f"```\n\n"
+        f"## Log\n"
+        f"- {today}: Projekt angelegt\n"
+    )
+
+    fm = {
+        "id": f"project-{slug}",
+        "title": name,
+        "type": "project",
+        "started": today,
+        "status": "active",
+        "tags": list(tags or []),
+    }
+    post = frontmatter.Post(body, **fm)
+    readme_path = proj_dir / "README.md"
+    readme_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+
+    # CONTEXT.md leeres Skeleton — befuellt via project_context() spaeter
+    context_path = proj_dir / "CONTEXT.md"
+    context_path.write_text(
+        f"# Kontext: {slug}\n\n"
+        "_Projekt-spezifische Regeln/Infos (Auftraggeber, Tech-Stack, Frist, "
+        f"Budget). Wird automatisch in den Bot-Prompt geladen wenn `activate_project({slug})` aktiv._\n\n"
+        "_(noch leer — fuelle via Bot-Tool `project_context(action='update')` "
+        "oder direkt im Editor)_\n",
+        encoding="utf-8",
+    )
+
+    return {
+        "slug": slug,
+        "path": vault.rel_path(proj_dir),
+        "id": f"project-{slug}",
+        "parent": parent,
+        "status": "created",
+    }
+
+
 # ---------- Project Context --------------------------------------------------
 
 
@@ -2462,6 +2596,7 @@ TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     "create_note":          {"title": "Note anlegen"},
     "create_task":          {"title": "Task anlegen"},
     "create_meeting":       {"title": "Meeting anlegen"},
+    "create_project":       {"title": "Projekt-Container anlegen"},
     "append_to_daily":      {"title": "An Daily-Note anhaengen"},
     "goal_log":             {"title": "Goal-Log Eintrag"},
     "project_context":      {"title": "Projekt-Kontext setzen"},

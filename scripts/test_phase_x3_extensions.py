@@ -84,6 +84,7 @@ def main() -> int:
         move_bulk = _raw("move_bulk")
         move_project_fn = _raw("move_project")
         read_proj_ctx = _raw("read_project_context")
+        create_proj = _raw("create_project")
 
         # ─── Test 1: edit_file_replace literal ────────────────────────────
         print("\n=== edit_file_replace (literal) ===")
@@ -205,6 +206,51 @@ def main() -> int:
         r = read_proj_ctx(project="xyz-doesnt-exist")
         check("missing: exists=False", r["exists"] is False)
         check("missing: content leer", r["content"] == "")
+
+        # ─── Test 13: create_project (top-level) ───────────────────────────
+        print("\n=== create_project (top-level) ===")
+        r = create_proj(name="Neues Projekt X", description="Test-Projekt")
+        check("create: status=created", r["status"] == "created")
+        check("create: slug=neues-projekt-x", r["slug"] == "neues-projekt-x")
+        check("create: id=project-...", r["id"] == "project-neues-projekt-x")
+        check("create: README angelegt",
+              (vault_path / "05_Projects" / "neues-projekt-x" / "README.md").is_file())
+        check("create: CONTEXT.md angelegt",
+              (vault_path / "05_Projects" / "neues-projekt-x" / "CONTEXT.md").is_file())
+        readme = (vault_path / "05_Projects" / "neues-projekt-x" / "README.md").read_text()
+        check("create: README enthaelt Frontmatter",
+              "id: project-neues-projekt-x" in readme)
+        check("create: README enthaelt Dataview",
+              "```dataview" in readme)
+
+        # ─── Test 14: create_project (idempotent — schon da) ──────────────
+        print("\n=== create_project (idempotent) ===")
+        r = create_proj(name="Neues Projekt X")
+        check("idempotent: status=exists", r["status"] == "exists")
+
+        # ─── Test 15: create_project (Subprojekt) ──────────────────────────
+        print("\n=== create_project (Subprojekt) ===")
+        r = create_proj(name="Sub-Y", parent="neues-projekt-x")
+        check("sub: status=created", r["status"] == "created")
+        check("sub: parent=neues-projekt-x", r["parent"] == "neues-projekt-x")
+        check("sub: README in Subordner",
+              (vault_path / "05_Projects" / "neues-projekt-x" / "sub-y" / "README.md").is_file())
+
+        # ─── Test 16: create_project unknown parent ────────────────────────
+        print("\n=== create_project (unknown parent) ===")
+        try:
+            create_proj(name="Z", parent="nonexistent")
+            check("unknown-parent abgelehnt", False)
+        except Exception as e:
+            check("unknown-parent abgelehnt", "nicht gefunden" in str(e).lower())
+
+        # ─── Test 17: create_project leerer Name ───────────────────────────
+        print("\n=== create_project (leer) ===")
+        try:
+            create_proj(name="")
+            check("leerer Name abgelehnt", False)
+        except Exception as e:
+            check("leerer Name abgelehnt", True)
 
     print()
     if failures:

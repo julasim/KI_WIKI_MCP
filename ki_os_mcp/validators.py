@@ -234,3 +234,12 @@ def validate_move_project(slug: str, parent: str | None) -> str | None:
 def validate_read_project_context(project: str) -> str | None:
     if e := _check_string_required(project, "project"): return e
     return None
+
+
+def validate_create_project(name: str, parent: str | None) -> str | None:
+    if e := _check_string_required(name, "name"): return e
+    slug = vault.slugify(name)
+    if e := _check_slug(slug): return e
+    if parent is not None and not isinstance(parent, str):
+        return _err("parent", "muss str oder None sein")
+    return None
