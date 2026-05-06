@@ -1752,7 +1752,10 @@ def vault_maintain() -> dict[str, Any]:
       1. Auto-Link alle Projekt-READMEs (Notes/Meetings)
       2. Context-Drift normalisieren (@home → home in Tasks)
       3. Daily-Backlinks: heute erstellte Items in heutige Daily-Note
-      4. Lint-Summary (was nicht auto-fixbar war)
+      4. Recurring-Tasks reaktivieren (daily/weekdays/weekly/monthly fällig)
+      5. Daily-Skeleton für morgen pre-create (idempotent)
+      6. Goal-Status-Check (Säulen-Drift, Habits/Sport-Score)
+      7. Lint-Summary (was nicht auto-fixbar war)
 
     Wird automatisch getriggert:
       - Nach jedem Schreibvorgang (immediate, async)
@@ -1765,6 +1768,61 @@ def vault_maintain() -> dict[str, Any]:
         Pipeline-Report mit pro-Schritt Status + Counts + Errors.
     """
     return _run_maintain_locked()
+
+
+@mcp.tool()
+def task_reactivate_recurring() -> dict[str, Any]:
+    """Reaktiviert fällige recurring Tasks (daily/weekdays/weekly/monthly).
+
+    Walked alle Tasks in 10_Life/tasks/, sucht status=done mit recurrence-FM
+    und fälligem Pattern (z.B. daily Tasks deren last_completed gestern war).
+    Setzt status zurück auf 'open', appendet "- YYYY-MM-DD: reaktiviert"
+    ans Body-Ende.
+
+    Idempotent: re-run findet schon-reaktivierte Tasks (status=open) und
+    skippt sie. Timezone-aware: nutzt Wien-Zeit damit nicht nach 22:00
+    fälschlich in den nächsten Tag übergesprungen wird.
+
+    Output: {checked: int, reactivated: [slug, ...], count: int, errors: [...]}
+    """
+    return maintain.step_task_reactivate_recurring()
+
+
+@mcp.tool()
+def create_daily_skeleton(date: str | None = None) -> dict[str, Any]:
+    """Erstellt eine Daily-Note (mit FM-Skeleton) für ein Datum.
+
+    Default: morgen (Wien-Zeit) — damit du jeden Morgen schon ein leeres
+    Daily-Template hast.
+
+    Args:
+        date: ISO-Datum (YYYY-MM-DD). Default = morgen Wien-Zeit.
+
+    Idempotent (TOCTOU-safe via O_EXCL): wenn die Datei schon existiert,
+    wird sie NICHT überschrieben.
+
+    Output: {date, path, created: bool, reason?}
+    """
+    return maintain.step_create_daily_skeleton(date)
+
+
+@mcp.tool()
+def goal_status_check() -> dict[str, Any]:
+    """Read-only Status-Check des 5y-Goal-Systems.
+
+    Liefert:
+      - drift: Status pro Anker-Bucket (weekly/monthly/quarterly) mit
+        age_days und ok/warn (Schwellen: 14/60/120 Tage).
+      - habits_7d: check/possible/pct + ok/warn (Soll: ≥80%)
+      - sport: d7/d30 Sessions + ok/warn (Wochen-Soll: 3)
+      - overall: ok/warn (warn wenn IRGENDEIN Bucket warn ist)
+
+    Schreibt nichts — pure Diagnose. Nutzbar für Bot-Briefing oder
+    Dashboard-Indicator.
+
+    Output: {date, drift, habits_7d, sport, overall}
+    """
+    return maintain.step_goal_status_check()
 
 
 @mcp.tool()
