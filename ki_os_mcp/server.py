@@ -24,6 +24,7 @@ from typing import Any
 import frontmatter
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
@@ -61,18 +62,60 @@ if MCP_TOKEN_LEGACY:
 # Set für O(1) Token-Lookup
 _VALID_TOKENS = {t for t in (MCP_TOKEN, MCP_TOKEN_LEGACY) if t}
 
+# ---------- Origin/Host Whitelist (MCP-Spec MUST) ----------------------------
+# Spec 2025-06-18 Transports §Security Warning: Server MUST validate Origin
+# header. FastMCP TransportSecuritySettings macht das nativ wenn
+# enable_dns_rebinding_protection=True UND allowed_hosts/allowed_origins
+# gesetzt sind.
+#
+# Default-Whitelist deckt unsere Production-URLs ab. Ueberschreibbar via ENV
+# (comma-separated) fuer Dev/Staging-Setups.
+
+_DEFAULT_ALLOWED_HOSTS = [
+    "wiki-mcp.sima.business",
+    "76-13-10-79.sslip.io",
+    "localhost",
+    "127.0.0.1",
+    f"localhost:{MCP_PORT}",
+    f"127.0.0.1:{MCP_PORT}",
+]
+_DEFAULT_ALLOWED_ORIGINS = [
+    "https://wiki-mcp.sima.business",
+    "https://wiki-dashboard.sima.business",
+    "https://76-13-10-79.sslip.io",
+    "https://claude.ai",
+    "https://claude.com",
+]
+
+_env_hosts = os.environ.get("MCP_ALLOWED_HOSTS", "").strip()
+_env_origins = os.environ.get("MCP_ALLOWED_ORIGINS", "").strip()
+ALLOWED_HOSTS = (
+    [h.strip() for h in _env_hosts.split(",") if h.strip()]
+    if _env_hosts else _DEFAULT_ALLOWED_HOSTS
+)
+ALLOWED_ORIGINS = (
+    [o.strip() for o in _env_origins.split(",") if o.strip()]
+    if _env_origins else _DEFAULT_ALLOWED_ORIGINS
+)
+
+log.info("Origin-Whitelist: %d Hosts + %d Origins", len(ALLOWED_HOSTS), len(ALLOWED_ORIGINS))
+
 # streamable_http_path="/" damit der Mount unter /mcp die Tools direkt
 # unter /mcp serviert (nicht unter /mcp/mcp).
 #
-# transport_security mit deaktivierter DNS-Rebinding-Protection: FastMCP
-# enabled das auto-magisch wenn host="127.0.0.1" (default) und blockt dann
-# alle Host-Header außer localhost — was uns von extern aussperrt (HTTP 421).
-# Unsere Bearer-Auth davor verhindert Rebinding-Angriffe schon (Browser hat
-# den Token nicht), darum ist Disable hier sicher.
+# DNS-Rebinding-Protection AN — Spec 2025-06-18 fordert Origin-Validation
+# als MUST. Bearer-Auth allein reicht nicht: ein boesartiger Browser-Tab
+# koennte (theoretisch) einen XSS-geleakten Token verwenden. Mit Whitelist
+# wird der Browser zum Mit-Validator: Browser blockt Cross-Origin requests
+# ausserhalb der Whitelist via CORS.
 mcp = FastMCP(
     "ki-os-vault",
     streamable_http_path="/",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=ALLOWED_HOSTS,
+        allowed_origins=ALLOWED_ORIGINS,
+    ),
 )
 
 
@@ -109,7 +152,7 @@ def search_vault(
         )
         return {"hits": hits, "total": len(hits)}
     except VaultError as e:
-        return {"error": str(e), "hits": [], "total": 0}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -134,7 +177,7 @@ def read_file(path: str) -> dict[str, Any]:
         else:
             return {"path": path, "raw": vault.read_text(path)}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -153,7 +196,7 @@ def list_files(path: str = "") -> dict[str, Any]:
     try:
         return {"path": path, "entries": vault.list_dir(path)}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -188,7 +231,7 @@ def list_tasks(
     """
     try:
         if status not in ("open", "done", "snoozed", "all"):
-            return {"error": f"Ungültiger status: {status} (open|done|snoozed|all)"}
+            raise ToolError(f"Ungültiger status: {status} (open|done|snoozed|all)")
         tasks_dir = vault.VAULT_PATH / "10_Life" / "tasks"
         if not tasks_dir.is_dir():
             return {"tasks": [], "total_matched": 0, "total_in_vault": 0}
@@ -265,7 +308,7 @@ def list_tasks(
             "total_in_vault": all_count,
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -297,7 +340,7 @@ def create_note(
     try:
         # STRICT VALIDATOR
         if err := validators.validate_create_note(title, project, body, tags, subpath):
-            return {"error": err}
+            raise ToolError(err)
         slug = vault.slugify(title)
         date = vault.today_iso()
         filename = f"{date}_{slug}.md"
@@ -310,9 +353,9 @@ def create_note(
         try:
             existing = vault.safe_path(rel)
             if existing.exists():
-                return {"error": f"Datei existiert bereits: {rel}"}
+                raise ToolError(f"Datei existiert bereits: {rel}")
         except VaultError as e:
-            return {"error": str(e)}
+            raise ToolError(str(e))
 
         post = frontmatter.Post(
             body,
@@ -342,7 +385,7 @@ def create_note(
 
         return {"path": rel, "id": slug, "created": date, "autolinked": autolinked}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -378,7 +421,7 @@ def create_task(
     try:
         # STRICT VALIDATOR
         if err := validators.validate_create_task(title, priority, due, context, project, recurrence):
-            return {"error": err}
+            raise ToolError(err)
         slug = vault.slugify(title)
         # Context auto-normalisieren (kein @-Präfix)
         if context:
@@ -388,9 +431,9 @@ def create_task(
 
         try:
             if vault.safe_path(rel).exists():
-                return {"error": f"Task existiert bereits: {rel}"}
+                raise ToolError(f"Task existiert bereits: {rel}")
         except VaultError as e:
-            return {"error": str(e)}
+            raise ToolError(str(e))
 
         meta: dict[str, Any] = {
             "id": task_id,
@@ -414,7 +457,7 @@ def create_task(
         vault.write_post(rel, post)
         return {"path": rel, "id": task_id}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -438,7 +481,7 @@ def append_to_daily(
         rel = vault.append_to_daily(text, section=section, d=date)
         return {"path": rel, "section": section}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Phase 2 Tools ----------------------------------------------------
@@ -490,7 +533,7 @@ def edit_file(
             "body_preview": preview,
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -524,11 +567,11 @@ def task(
     try:
         # STRICT VALIDATOR
         if err := validators.validate_task_action(id, action, snooze_until, due, priority):
-            return {"error": err}
+            raise ToolError(err)
 
         task_path = vault.find_task(id)
         if not task_path:
-            return {"error": f"Task nicht gefunden: {id}"}
+            raise ToolError(f"Task nicht gefunden: {id}")
         rel = vault.rel_path(task_path)
         post = vault.read_post(rel)
 
@@ -541,13 +584,13 @@ def task(
         elif action == "snooze":
             target = snooze_until or due
             if not target:
-                return {"error": "snooze braucht snooze_until (oder due) Parameter"}
+                raise ToolError("snooze braucht snooze_until (oder due) Parameter")
             post["status"] = "snoozed"
             post["due"] = target
         elif action == "edit":
             if priority is not None:
                 if priority not in ("urgent", "high", "medium", "low"):
-                    return {"error": f"Ungültige Priorität: {priority}"}
+                    raise ToolError(f"Ungültige Priorität: {priority}")
                 post["priority"] = priority
             if due is not None:
                 post["due"] = due
@@ -562,7 +605,7 @@ def task(
             "action_applied": action,
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -598,7 +641,7 @@ def create_meeting(
     try:
         # STRICT VALIDATOR
         if err := validators.validate_create_meeting(title, attendees, project, date):
-            return {"error": err}
+            raise ToolError(err)
         d = date or vault.today_iso()
         slug = vault.slugify(title)
         filename = f"{d}_{slug}.md"
@@ -609,9 +652,9 @@ def create_meeting(
 
         try:
             if vault.safe_path(rel).exists():
-                return {"error": f"Meeting existiert bereits: {rel}"}
+                raise ToolError(f"Meeting existiert bereits: {rel}")
         except VaultError as e:
-            return {"error": str(e)}
+            raise ToolError(str(e))
 
         meta: dict[str, Any] = {
             "id": slug,
@@ -647,7 +690,7 @@ def create_meeting(
 
         return {"path": rel, "id": slug, "autolinked": autolinked}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Two-Step Delete ---------------------------------------------------
@@ -673,7 +716,7 @@ def request_delete(path: str, reason: str = "") -> dict[str, Any]:
     try:
         full = vault.safe_path(path)
         if not full.is_file():
-            return {"error": f"Datei nicht gefunden: {path}"}
+            raise ToolError(f"Datei nicht gefunden: {path}")
         # Preview: erste 200 Zeichen + Größe
         size = full.stat().st_size
         try:
@@ -698,7 +741,7 @@ def request_delete(path: str, reason: str = "") -> dict[str, Any]:
             "next_step": f"confirm_delete(token='{token}') ausführen um zu löschen",
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -714,7 +757,7 @@ def confirm_delete(token: str) -> dict[str, Any]:
     """
     pending = _pending_deletes.pop(token, None)
     if not pending:
-        return {"error": f"Token unbekannt oder abgelaufen: {token}"}
+        raise ToolError(f"Token unbekannt oder abgelaufen: {token}")
     try:
         # Snapshot vor Delete
         path = pending["path"]
@@ -731,7 +774,7 @@ def confirm_delete(token: str) -> dict[str, Any]:
     except VaultError as e:
         # Bei Fehler Token wieder einsetzen damit Retry möglich ist
         _pending_deletes[token] = pending
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Move Tool (Wikilink-Migration) -----------------------------------
@@ -767,12 +810,12 @@ def move(
     try:
         src = vault.safe_path(source)
         if not src.is_file():
-            return {"error": f"Quelldatei nicht gefunden: {source}"}
+            raise ToolError(f"Quelldatei nicht gefunden: {source}")
         dst = vault.safe_path(dest)
         if dst.exists():
-            return {"error": f"Zieldatei existiert bereits: {dest}"}
+            raise ToolError(f"Zieldatei existiert bereits: {dest}")
         if src == dst:
-            return {"error": "source und dest sind identisch"}
+            raise ToolError("source und dest sind identisch")
 
         # ID-Berechnung nur für .md
         old_id: str | None = None
@@ -912,7 +955,7 @@ def move(
             "wikilinks_updated": updated_files,
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Goal Log ---------------------------------------------------------
@@ -971,7 +1014,7 @@ def goal_log(
         p.write_text(existing.rstrip() + appendix, encoding="utf-8")
         return {"path": rel, "appended": appendix.strip().split("\n")[0]}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Project Context --------------------------------------------------
@@ -997,11 +1040,11 @@ def project_context(
     """
     try:
         if mode not in ("append", "replace"):
-            return {"error": f"mode muss 'append' oder 'replace' sein, nicht {mode}"}
+            raise ToolError(f"mode muss 'append' oder 'replace' sein, nicht {mode}")
         rel = f"05_Projects/{project}/CONTEXT.md"
         p = vault.safe_path(rel)
         if not p.parent.is_dir():
-            return {"error": f"Projekt-Folder nicht gefunden: 05_Projects/{project}/"}
+            raise ToolError(f"Projekt-Folder nicht gefunden: 05_Projects/{project}/")
         if mode == "replace" or not p.exists():
             p.parent.mkdir(parents=True, exist_ok=True)
             content = f"# Projekt-Kontext: {project}\n\n_Updated: {vault.today_iso()}_\n\n{text.strip()}\n"
@@ -1012,7 +1055,7 @@ def project_context(
             p.write_text(existing.rstrip() + appendix, encoding="utf-8")
         return {"path": rel, "mode": mode}
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Block 3: Premium-Tools -------------------------------------------
@@ -1113,7 +1156,7 @@ def daily_briefing(date: str | None = None) -> dict[str, Any]:
             },
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ============================================================================
@@ -1442,9 +1485,9 @@ def read_reminders() -> dict[str, Any]:
     try:
         data = _json.loads(p.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
-        return {"reminders": [], "total": 0, "error": f"Parse-Fehler: {e}"}
+        return {"reminders": [], "total": 0, "reason": f"Parse-Fehler: {e}"}
     if not isinstance(data, list):
-        return {"reminders": [], "total": 0, "error": "Erwarte JSON-Array"}
+        return {"reminders": [], "total": 0, "reason": "Erwarte JSON-Array"}
     return {"reminders": data, "total": len(data)}
 
 
@@ -1463,7 +1506,7 @@ def read_yesterday_daily() -> dict[str, Any]:
     try:
         post = vault.read_post(rel)
     except VaultError as e:
-        return {"found": False, "date": yest, "error": str(e)}
+        return {"found": False, "date": yest, "reason": str(e)}
     fm = post.metadata
     out: dict[str, Any] = {"found": True, "date": yest}
     for k in ("energy", "mood", "key_insight"):
@@ -1647,7 +1690,7 @@ def vault_lint(include_structural: bool = False) -> dict[str, Any]:
             "orphans": orphans[:50],
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -1741,7 +1784,7 @@ def _run_maintain_locked() -> dict[str, Any]:
         _last_maintain["status"] = "error"
         _last_maintain["summary"] = {"exception": str(e)}
         log.error("maintain run failed: %s", e)
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -1898,7 +1941,7 @@ def vault_autolink(dry_run: bool = False) -> dict[str, Any]:
             "dry_run": dry_run,
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 @mcp.tool()
@@ -1920,7 +1963,7 @@ def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any
         full = vault.safe_path(path)
         existed = full.exists()
         if existed and not overwrite:
-            return {"error": f"Datei existiert ({path}). overwrite=true setzen um zu ersetzen."}
+            raise ToolError(f"Datei existiert ({path}). overwrite=true setzen um zu ersetzen.")
         if existed:
             # Snapshot vor Overwrite
             try:
@@ -1937,7 +1980,7 @@ def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any
             "overwritten": existed,
         }
     except VaultError as e:
-        return {"error": str(e)}
+        raise ToolError(str(e))
 
 
 # ---------- Auth Middleware --------------------------------------------------
@@ -2007,6 +2050,13 @@ async def health(_: Request) -> JSONResponse:
             "uptime_seconds": int(_t.time() - _BOOT_TIME),
             "rate_limit_per_min": int(os.environ.get("MCP_RATE_LIMIT_PER_MIN", "60")),
             "snapshot_enabled": os.environ.get("MCP_SNAPSHOT_ENABLED", "1") not in ("0", "false", "no"),
+            "spec_compliance": {
+                "origin_validation": True,           # Spec MUST §Transports
+                "tool_error_isError": True,           # Spec §Tools error-handling
+                "tool_annotations_set": len(TOOL_ANNOTATIONS),
+                "allowed_hosts": len(ALLOWED_HOSTS),
+                "allowed_origins": len(ALLOWED_ORIGINS),
+            },
             "maintain": {
                 "status": _last_maintain["status"],
                 "last_run": _last_maintain["finished_at"],
@@ -2044,6 +2094,101 @@ def _wrap_tools_with_audit() -> None:
     log.info("Audit-Wrapper aktiv für %d Tools", wrapped)
 
 
+# ---------- Tool-Annotations (MCP-Spec §Tools) -------------------------------
+# Annotations geben Clients (Claude Code, claude.ai) Hints fuer das Trust&Safety-
+# UI: read-only Tools koennen auto-approved werden, destructive bekommen
+# Confirmation-Prompt, idempotent zeigt "kann sicher wiederholt werden".
+#
+# Hint: Spec sagt Annotations sind UNTRUSTED metadata — Client darf nicht blind
+# vertrauen, dass `readOnlyHint:true` heisst dass Tool wirklich read-only ist.
+# Sie sind UI-Hilfe, kein Sicherheitsmechanismus. Echter Schutz: Bearer-Auth +
+# strikte Server-side-Validation (haben wir).
+
+TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
+    # --- Read-only ---
+    "search_vault":         {"readOnlyHint": True, "title": "Vault-Volltextsuche"},
+    "read_file":            {"readOnlyHint": True, "title": "Datei lesen"},
+    "list_files":           {"readOnlyHint": True, "title": "Folder-Inhalt listen"},
+    "list_tasks":           {"readOnlyHint": True, "title": "Tasks listen"},
+    "daily_briefing":       {"readOnlyHint": True, "title": "Tagesbriefing"},
+    "self_test":            {"readOnlyHint": True, "title": "Server-Self-Test"},
+    "read_vision":          {"readOnlyHint": True, "title": "5y-Vision lesen"},
+    "read_saeulen":         {"readOnlyHint": True, "title": "Saeulen-Tabelle lesen"},
+    "read_drift":           {"readOnlyHint": True, "title": "Drift-Anker lesen"},
+    "read_habits":          {"readOnlyHint": True, "title": "Habits lesen"},
+    "read_sport":           {"readOnlyHint": True, "title": "Sport-Sessions lesen"},
+    "read_books":           {"readOnlyHint": True, "title": "Buecher lesen"},
+    "read_wins":            {"readOnlyHint": True, "title": "Wins lesen"},
+    "compute_streak":       {"readOnlyHint": True, "title": "Habit-Streak berechnen"},
+    "read_reminders":       {"readOnlyHint": True, "title": "Reminders lesen"},
+    "read_yesterday_daily": {"readOnlyHint": True, "title": "Gestrige Daily lesen"},
+    "goal_status_check":    {"readOnlyHint": True, "title": "Goal-Status-Check"},
+    "vault_lint":           {"readOnlyHint": True, "title": "Vault-Schema-Linter"},
+    # --- Write (creates new content, kein destructive Update) ---
+    "create_note":          {"title": "Note anlegen"},
+    "create_task":          {"title": "Task anlegen"},
+    "create_meeting":       {"title": "Meeting anlegen"},
+    "append_to_daily":      {"title": "An Daily-Note anhaengen"},
+    "goal_log":             {"title": "Goal-Log Eintrag"},
+    "project_context":      {"title": "Projekt-Kontext setzen"},
+    "raw_write":            {"destructiveHint": True, "title": "Raw File-Write (kann ueberschreiben)"},
+    # --- Edit (modifies existing) ---
+    "edit_file":            {"title": "Datei editieren"},
+    "task":                 {"title": "Task-Aktion (done/reopen/snooze/edit)"},
+    "move":                 {"destructiveHint": True, "title": "Datei verschieben (mit Wikilink-Migration)"},
+    # --- Delete (2-step pattern) ---
+    "request_delete":       {"destructiveHint": True, "title": "Loesch-Anfrage (Stufe 1)"},
+    "confirm_delete":       {"destructiveHint": True, "title": "Loeschen bestaetigen (Stufe 2)"},
+    # --- Maintain (idempotent — wiederholbar ohne Drift) ---
+    "vault_autolink":          {"idempotentHint": True, "title": "Auto-Linking refresh"},
+    "vault_maintain":          {"idempotentHint": True, "title": "Self-Maintenance Pipeline"},
+    "task_reactivate_recurring": {"idempotentHint": True, "title": "Recurring-Tasks reaktivieren"},
+    "create_daily_skeleton":   {"idempotentHint": True, "title": "Daily-Skeleton vorbereiten"},
+}
+
+
+def _set_tool_annotations() -> None:
+    """Setzt Annotations auf alle registrierten Tools.
+
+    Best-effort: wenn das offizielle SDK das `annotations`-Feld nicht
+    expose't (Issue #511), wird ein Warning geloggt aber Tools laufen
+    weiter. Annotations sind nur UX-Hint, kein funktional-kritisches
+    Feature.
+    """
+    try:
+        from mcp.types import ToolAnnotations
+    except ImportError:
+        log.warning("mcp.types.ToolAnnotations nicht verfuegbar — Tool-Annotations skipped")
+        return
+    try:
+        tools = mcp._tool_manager._tools  # type: ignore[attr-defined]
+    except AttributeError:
+        log.warning("Tool-Manager nicht zugaenglich fuer Annotations")
+        return
+
+    set_count = 0
+    missing: list[str] = []
+    for name, hints in TOOL_ANNOTATIONS.items():
+        if name not in tools:
+            missing.append(name)
+            continue
+        try:
+            tools[name].annotations = ToolAnnotations(**hints)
+            set_count += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("Annotation-Fail %s: %s", name, e)
+
+    # Warne bei Tools ohne Annotation (Drift-Schutz)
+    annotated = set(TOOL_ANNOTATIONS) & set(tools.keys())
+    unannotated = set(tools.keys()) - annotated
+    if unannotated:
+        log.warning("Tools ohne Annotation: %s", sorted(unannotated))
+    if missing:
+        log.warning("Annotation fuer fehlendes Tool: %s", sorted(missing))
+
+    log.info("Tool-Annotations gesetzt: %d/%d", set_count, len(tools))
+
+
 def create_app() -> Starlette:
     """Mount MCP's Streamable-HTTP transport on /mcp + health on /health.
 
@@ -2055,6 +2200,7 @@ def create_app() -> Starlette:
     Delegiert lifespan an mcp_app damit dessen session_manager initialisiert.
     """
     _wrap_tools_with_audit()
+    _set_tool_annotations()
     mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
