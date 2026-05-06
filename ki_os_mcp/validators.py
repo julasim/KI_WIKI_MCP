@@ -191,3 +191,46 @@ def validate_append_to_daily(text: str, section: str, date: str | None) -> str |
     if e := _check_string_required(section, "section"): return e
     if date and (e := _check_iso_date(date, "date")): return e
     return None
+
+
+# ---------- Validators fuer Phase X3+: edit_replace, move_bulk, move_project,
+#            read_project_context ---------------------------------------------
+
+
+def validate_edit_file_replace(
+    path: str, find: str, replace: str, regex: bool
+) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if not isinstance(find, str) or not find:
+        return _err("find", "Pflicht — nicht-leerer String")
+    if not isinstance(replace, str):
+        return _err("replace", "muss String sein (auch leerer String erlaubt)")
+    if not isinstance(regex, bool):
+        return _err("regex", "muss bool sein")
+    return None
+
+
+def validate_move_bulk(
+    sources: list[str], dest_dir: str, overwrite: bool
+) -> str | None:
+    if not isinstance(sources, list) or not sources:
+        return _err("sources", "muss nicht-leere Liste sein")
+    if e := _check_string_required(dest_dir, "dest_dir"): return e
+    if not isinstance(overwrite, bool):
+        return _err("overwrite", "muss bool sein")
+    for i, s in enumerate(sources):
+        if not isinstance(s, str) or not s.strip():
+            return _err(f"sources[{i}]", "leerer/nicht-string Eintrag")
+    return None
+
+
+def validate_move_project(slug: str, parent: str | None) -> str | None:
+    if e := _check_string_required(slug, "slug"): return e
+    if parent is not None and not isinstance(parent, str):
+        return _err("parent", "muss str oder None sein")
+    return None
+
+
+def validate_read_project_context(project: str) -> str | None:
+    if e := _check_string_required(project, "project"): return e
+    return None

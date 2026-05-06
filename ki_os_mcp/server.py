@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -540,6 +542,98 @@ def edit_file(
         raise ToolError(str(e))
 
 
+# ---------- edit_file_replace (find/replace) ---------------------------------
+# Sicherheits-Konstanten 1:1 aus Bot uebernommen — wir wollen identisches
+# Verhalten weil dieser Pfad bisher im Bot lebte und produktionsbewaehrt war.
+
+EDIT_FILE_MAX_BYTES = 5 * 1024 * 1024     # 5 MB — keine Massenfile-Edits
+EDIT_FILE_MAX_REGEX_LEN = 500             # >500 chars Regex = vermutlich Halluzination
+# Pathological-Regex-Patterns die ReDoS triggern koennen (nested quantifiers)
+_REDOS_PATTERNS = [
+    re.compile(r"\([^)]*[+*]\)[+*]"),     # (a+)+ / (a*)*
+    re.compile(r"\([^)]*\|[^)]*\)[+*]"),  # (a|a)+ / (a|b)*
+]
+
+
+@mcp.tool()
+def edit_file_replace(
+    path: str,
+    find: str,
+    replace: str,
+    regex: bool = False,
+) -> dict[str, Any]:
+    """Find/Replace innerhalb eines Files (literal oder regex).
+
+    Im Gegensatz zu `edit_file` (das ganze Body/FM-Felder ersetzt) macht
+    dieses Tool partielle In-File-Edits — typisch fuer LLM-Korrekturen
+    ("ersetze 'Donnerstag' durch 'Freitag'").
+
+    Sicherheit:
+      - Path via vault.safe_path → kein Path-Traversal
+      - File-Size-Cap 5 MB → kein OOM bei Riesen-Files
+      - Bei regex=True: Pattern-Length-Cap 500 chars + ReDoS-Heuristik
+        (nested quantifier wie (a+)+, (a|b)* werden abgelehnt)
+      - Snapshot vor Write fuer Rollback
+
+    Args:
+        path: Rel-Pfad zur Datei
+        find: Such-String (literal) oder Regex-Pattern (wenn regex=True)
+        replace: Ersetzungs-String. Bei regex: \\1, \\2 etc. fuer Capture-Groups.
+        regex: True = find als Python-regex. False = literal substring.
+
+    Returns:
+        {path, replacements: int, file_size_bytes: int}
+    """
+    if err := validators.validate_edit_file_replace(path, find, replace, regex):
+        raise ToolError(err)
+    try:
+        p = vault.safe_path(path)
+    except VaultError as e:
+        raise ToolError(str(e))
+    if not p.is_file():
+        raise ToolError(f"Datei nicht gefunden: {path}")
+    size = p.stat().st_size
+    if size > EDIT_FILE_MAX_BYTES:
+        raise ToolError(
+            f"Datei zu gross fuer edit_file_replace ({size} > {EDIT_FILE_MAX_BYTES}B)"
+        )
+
+    if regex:
+        if len(find) > EDIT_FILE_MAX_REGEX_LEN:
+            raise ToolError(
+                f"Regex zu lang ({len(find)} > {EDIT_FILE_MAX_REGEX_LEN})"
+            )
+        for redos_pat in _REDOS_PATTERNS:
+            if redos_pat.search(find):
+                raise ToolError(
+                    f"Regex-Pattern enthaelt pathologisches Konstrukt "
+                    f"(nested quantifier) — ReDoS-Risiko: {find[:60]!r}"
+                )
+        try:
+            content = p.read_text(encoding="utf-8")
+            new_text, n = re.subn(find, replace, content)
+        except re.error as e:
+            raise ToolError(f"Regex-Syntax-Fehler in {find[:50]!r}: {e}")
+    else:
+        content = p.read_text(encoding="utf-8")
+        n = content.count(find)
+        new_text = content.replace(find, replace)
+
+    if n == 0:
+        return {"path": path, "replacements": 0,
+                "file_size_bytes": size, "changed": False}
+
+    # Snapshot vor Write
+    snapshot.snapshot_path(path, content.encode("utf-8"), "edit_replace")
+    p.write_text(new_text, encoding="utf-8")
+    return {
+        "path": path,
+        "replacements": n,
+        "file_size_bytes": p.stat().st_size,
+        "changed": True,
+    }
+
+
 @mcp.tool()
 def task(
     id: str,
@@ -962,6 +1056,197 @@ def move(
         raise ToolError(str(e))
 
 
+# ---------- move_bulk: mehrere Files in einen Ordner ------------------------
+
+
+@mcp.tool()
+def move_bulk(
+    sources: list[str],
+    dest_dir: str,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Verschiebt mehrere Dateien/Ordner in einen Ziel-Ordner.
+
+    Spart pro Item einen Tool-Call (LLM-Loop-Iterationen). Pro Item wird
+    Erfolg/Fehler getrennt gemeldet, alle teilen sich denselben Tool-Call.
+
+    Wikilinks werden NICHT migriert (anders als beim single-file `move`):
+    bei Bulk-Move bleiben die IDs typischerweise gleich (gleicher Filename),
+    nur der Ordner aendert sich. Falls eine Bulk-Op auch IDs aendert (z.B.
+    Datei rename plus move), den Single-`move`-Pfad pro Datei nutzen.
+
+    Args:
+        sources: Liste von vault-relativen Pfaden (Files oder Ordner)
+        dest_dir: vault-relativer Zielordner (wird angelegt wenn fehlt)
+        overwrite: True erlaubt Ueberschreiben existierender Files
+
+    Returns:
+        {moved: [name, ...], failed: [{name, reason}, ...],
+         dest_dir: str, success_count: int, fail_count: int}
+    """
+    if err := validators.validate_move_bulk(sources, dest_dir, overwrite):
+        raise ToolError(err)
+    try:
+        dst = vault.safe_path(dest_dir)
+    except VaultError as e:
+        raise ToolError(f"dest_dir: {e}")
+
+    if dst.exists() and not dst.is_dir():
+        raise ToolError(f"Ziel ist eine Datei, kein Ordner: {dest_dir}")
+    dst.mkdir(parents=True, exist_ok=True)
+
+    moved: list[str] = []
+    failed: list[dict[str, str]] = []
+
+    for src_rel in sources:
+        if not isinstance(src_rel, str) or not src_rel.strip():
+            failed.append({"name": str(src_rel), "reason": "leerer/ungueltiger Eintrag"})
+            continue
+        try:
+            src = vault.safe_path(src_rel)
+        except VaultError as e:
+            failed.append({"name": src_rel, "reason": f"Pfad: {e}"})
+            continue
+        if not src.exists():
+            failed.append({"name": src_rel, "reason": "nicht gefunden"})
+            continue
+        if src == vault.VAULT_PATH:
+            failed.append({"name": src_rel, "reason": "Vault-Root unbeweglich"})
+            continue
+
+        final = dst / src.name
+        if final.exists():
+            if not overwrite:
+                failed.append({"name": src.name, "reason": "Ziel existiert (overwrite=false)"})
+                continue
+            try:
+                if final.is_dir():
+                    shutil.rmtree(final)
+                else:
+                    final.unlink()
+            except Exception as e:  # noqa: BLE001
+                failed.append({"name": src.name, "reason": f"overwrite-cleanup: {e}"})
+                continue
+
+        try:
+            shutil.move(str(src), str(final))
+            moved.append(src.name)
+        except Exception as e:  # noqa: BLE001
+            failed.append({"name": src.name, "reason": str(e)})
+
+    return {
+        "moved": moved,
+        "failed": failed,
+        "dest_dir": dest_dir,
+        "success_count": len(moved),
+        "fail_count": len(failed),
+    }
+
+
+# ---------- move_project: Projekt-Folder verschieben/nesten ------------------
+
+
+def _find_project_dir(slug: str) -> Any:
+    """Sucht 05_Projects/<slug>/ rekursiv (Subprojekte erlaubt). Returns Path or None."""
+    projects_root = vault.VAULT_PATH / "05_Projects"
+    if not projects_root.is_dir():
+        return None
+    slug = slug.strip().lower()
+    if slug.startswith("project-"):
+        slug = slug[len("project-"):]
+    # 1. Top-level
+    top = projects_root / slug
+    if top.is_dir():
+        return top
+    # 2. Rekursiv (Subprojekte)
+    matches = []
+    for d in projects_root.rglob("*"):
+        if d.is_dir() and d.name == slug:
+            matches.append(d)
+    if len(matches) == 1:
+        return matches[0]
+    return None  # nicht gefunden ODER mehrdeutig
+
+
+@mcp.tool()
+def move_project(
+    slug: str,
+    parent: str | None = None,
+) -> dict[str, Any]:
+    """Verschiebt ein Projekt unter `parent` (= macht es zum Subprojekt) ODER
+    zurueck auf Top-Level (parent=None).
+
+    Slug + parent werden case-insensitive aufgeloest (auch mit `project-` Prefix).
+    Subprojekt-Suche ist rekursiv → findet Projekte ueberall unter 05_Projects/.
+    Schleifen-Schutz: ein Projekt kann nicht in seinen eigenen Sub-Tree verschoben werden.
+
+    Wikilinks werden NICHT geupdated (anders als beim single-file `move`):
+    Projekte werden via [[id]] referenziert wo `id = "project-<slug>"`. Slug
+    bleibt beim Move gleich, nur der Pfad aendert sich → keine Link-Updates noetig.
+    Frontmatter `project: <slug>` der enthaltenen Notes/Meetings bleibt korrekt.
+
+    Args:
+        slug: Projekt-Slug (z.B. "matura" oder "project-matura")
+        parent: neuer Parent-Slug (None = Top-Level)
+
+    Returns:
+        {old_path, new_path, parent, status}
+    """
+    if err := validators.validate_move_project(slug, parent):
+        raise ToolError(err)
+    src = _find_project_dir(slug)
+    if src is None:
+        raise ToolError(f"Projekt nicht gefunden (oder mehrdeutig): {slug}")
+
+    projects_root = vault.VAULT_PATH / "05_Projects"
+
+    # Ziel bestimmen
+    if parent and parent.strip():
+        clean_parent = parent.strip().lower()
+        if clean_parent.startswith("project-"):
+            clean_parent = clean_parent[len("project-"):]
+        clean_slug = src.name
+        if clean_parent == clean_slug:
+            raise ToolError("Projekt kann nicht sich selbst als Parent haben")
+        parent_dir = _find_project_dir(clean_parent)
+        if parent_dir is None:
+            raise ToolError(f"Parent-Projekt nicht gefunden: {parent}")
+        # Zyklen-Schutz: parent darf nicht unter src liegen
+        try:
+            parent_dir.relative_to(src)
+            raise ToolError(
+                f"Parent {parent!r} liegt bereits unter {clean_slug!r} — wuerde Schleife erzeugen"
+            )
+        except ValueError:
+            pass
+        dst = parent_dir / clean_slug
+    else:
+        dst = projects_root / src.name
+
+    if dst.resolve() == src.resolve():
+        return {
+            "old_path": vault.rel_path(src),
+            "new_path": vault.rel_path(src),
+            "parent": parent,
+            "status": "no_change",
+        }
+    if dst.exists():
+        raise ToolError(f"Ziel existiert bereits: {vault.rel_path(dst)}")
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(src), str(dst))
+    except Exception as e:  # noqa: BLE001
+        raise ToolError(f"move fehlgeschlagen: {e}")
+
+    return {
+        "old_path": str(src.relative_to(vault.VAULT_PATH)).replace("\\", "/"),
+        "new_path": vault.rel_path(dst),
+        "parent": parent,
+        "status": "moved",
+    }
+
+
 # ---------- Goal Log ---------------------------------------------------------
 
 
@@ -1064,6 +1349,52 @@ def project_context(
         return {"path": rel, "mode": mode}
     except VaultError as e:
         raise ToolError(str(e))
+
+
+@mcp.tool()
+def read_project_context(project: str) -> dict[str, Any]:
+    """Liest CONTEXT.md eines Projekts.
+
+    Path: 05_Projects/<project>/CONTEXT.md (rekursive Suche im Tree).
+
+    Args:
+        project: Projekt-Slug (mit oder ohne 'project-' Prefix)
+
+    Returns:
+        {project, path, exists, content} — content ist leer wenn Datei fehlt.
+    """
+    if err := validators.validate_read_project_context(project):
+        raise ToolError(err)
+    proj_dir = _find_project_dir(project)
+    if proj_dir is None:
+        return {
+            "project": project,
+            "path": None,
+            "exists": False,
+            "content": "",
+            "reason": "Projekt-Folder nicht gefunden",
+        }
+
+    context_file = proj_dir / "CONTEXT.md"
+    if not context_file.is_file():
+        return {
+            "project": proj_dir.name,
+            "path": vault.rel_path(context_file),
+            "exists": False,
+            "content": "",
+        }
+
+    try:
+        content = context_file.read_text(encoding="utf-8").replace("\r\n", "\n")
+    except OSError as e:
+        raise ToolError(f"Lese-Fehler {context_file.name}: {e}")
+
+    return {
+        "project": proj_dir.name,
+        "path": vault.rel_path(context_file),
+        "exists": True,
+        "content": content,
+    }
 
 
 # ---------- Block 3: Premium-Tools -------------------------------------------
@@ -2137,8 +2468,13 @@ TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     "raw_write":            {"destructiveHint": True, "title": "Raw File-Write (kann ueberschreiben)"},
     # --- Edit (modifies existing) ---
     "edit_file":            {"title": "Datei editieren"},
+    "edit_file_replace":    {"title": "Find/Replace im File"},
     "task":                 {"title": "Task-Aktion (done/reopen/snooze/edit)"},
     "move":                 {"destructiveHint": True, "title": "Datei verschieben (mit Wikilink-Migration)"},
+    "move_bulk":            {"destructiveHint": True, "title": "Bulk-Move mehrerer Files"},
+    "move_project":         {"destructiveHint": True, "title": "Projekt-Folder verschieben/nesten"},
+    # --- Read project meta ---
+    "read_project_context": {"readOnlyHint": True, "title": "Projekt-CONTEXT.md lesen"},
     # --- Delete (2-step pattern) ---
     "request_delete":       {"destructiveHint": True, "title": "Loesch-Anfrage (Stufe 1)"},
     "confirm_delete":       {"destructiveHint": True, "title": "Loeschen bestaetigen (Stufe 2)"},
