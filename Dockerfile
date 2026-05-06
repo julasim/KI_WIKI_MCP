@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # (jeder Code-Change rebuildet das Image sowieso).
 COPY pyproject.toml ./
 COPY ki_os_mcp/ ./ki_os_mcp/
+COPY scripts/ ./scripts/
 RUN pip install --no-cache-dir .
 
 ENV PYTHONUNBUFFERED=1 \
