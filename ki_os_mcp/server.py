@@ -35,7 +35,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Mount, Route
 
-from ki_os_mcp import audit, maintain, snapshot, validators, vault
+from ki_os_mcp import audit, maintain, oauth, oauth_routes, snapshot, validators, vault
 from ki_os_mcp.ratelimit import RateLimitMiddleware
 from ki_os_mcp.vault import VaultError
 
@@ -2454,20 +2454,39 @@ def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any
 # ---------- Auth Middleware --------------------------------------------------
 
 
-class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Validiert `Authorization: Bearer <token>` gegen MCP_TOKEN(_LEGACY).
+class DualAuthMiddleware(BaseHTTPMiddleware):
+    """Dual-Auth: OAuth 2.1 JWT (bevorzugt) + statischer Bearer-Token (legacy).
 
-    Ausnahmen:
-      - GET /health  (für Docker-healthcheck)
-      - leerer MCP_TOKEN deaktiviert Auth (dev-only, Warnung beim Boot)
+    Validierung:
+      1. JWT-Format-Detection (header.payload.signature → 3 Punkte) → OAuth-Validation
+      2. Sonst → statischer Bearer-Token-Match wie bisher
 
-    Auth-Events werden audit-geloggt (success + fail).
+    Ausnahmen (kein Auth-Check):
+      - GET /health
+      - GET /.well-known/oauth-* (Discovery muss public sein)
+      - GET/POST /oauth/* (OAuth-Server-Endpoints sind via PKCE+Login geschuetzt)
+
+    Bei 401: WWW-Authenticate-Header weist auf Auth-Server hin (RFC 9728).
     """
 
+    PUBLIC_PATHS = ("/health", "/.well-known/", "/oauth/")
+
+    def _is_public(self, path: str) -> bool:
+        return path == "/health" or any(path.startswith(p) for p in self.PUBLIC_PATHS)
+
+    def _www_authenticate(self) -> str:
+        # Spec-konformer Hint: Client soll das resource-metadata-doc holen
+        return (
+            'Bearer realm="ki-os-mcp", '
+            f'resource_metadata="{oauth.OAUTH_RESOURCE.rstrip("/")}/.well-known/oauth-protected-resource"'
+        )
+
     async def dispatch(self, request: Request, call_next):
-        if request.url.path == "/health":
+        if self._is_public(request.url.path):
             return await call_next(request)
-        if not _VALID_TOKENS:
+
+        # Dev-Mode: keine Tokens konfiguriert → durchwinken (mit Warning bereits beim Boot)
+        if not _VALID_TOKENS and not oauth.is_configured():
             return await call_next(request)
 
         client_ip = (
@@ -2479,15 +2498,53 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         auth = request.headers.get("authorization", "")
         if not auth.startswith("Bearer "):
             audit.log_auth(False, client_ip, "Missing Bearer prefix", ua)
-            return JSONResponse({"error": "Missing Bearer token"}, status_code=401)
+            return JSONResponse(
+                {"error": "Missing Bearer token"},
+                status_code=401,
+                headers={"WWW-Authenticate": self._www_authenticate()},
+            )
         token = auth.removeprefix("Bearer ").strip()
+
+        # JWT-Format-Detection: 3 base64url-segments durch Punkte getrennt
+        if oauth.is_configured() and token.count(".") == 2:
+            claims = oauth.verify_access_token(token)
+            if claims is not None:
+                # OAuth-Pfad: gueltig
+                request.state.auth_subject = claims.get("sub")
+                request.state.auth_client_id = claims.get("client_id")
+                request.state.auth_method = "oauth"
+                return await call_next(request)
+            # JWT-Format aber ungueltig → loggen + 401
+            audit.log_auth(False, client_ip, "Invalid JWT", ua)
+            return JSONResponse(
+                {"error": "invalid_token", "error_description": "JWT abgelaufen oder Signatur falsch"},
+                status_code=401,
+                headers={"WWW-Authenticate": self._www_authenticate()},
+            )
+
+        # Fallback: statischer Bearer-Token-Match (legacy)
+        if not _VALID_TOKENS:
+            audit.log_auth(False, client_ip, "No static tokens configured", ua)
+            return JSONResponse(
+                {"error": "invalid_token"},
+                status_code=401,
+                headers={"WWW-Authenticate": self._www_authenticate()},
+            )
         if token not in _VALID_TOKENS:
             audit.log_auth(False, client_ip, "Invalid token", ua)
-            return JSONResponse({"error": "Invalid token"}, status_code=401)
-        # Wenn Legacy-Token verwendet wird, in Audit hervorheben
+            return JSONResponse(
+                {"error": "Invalid token"},
+                status_code=401,
+                headers={"WWW-Authenticate": self._www_authenticate()},
+            )
         if MCP_TOKEN_LEGACY and token == MCP_TOKEN_LEGACY:
             audit.log_auth(True, client_ip, "legacy token", ua)
+        request.state.auth_method = "bearer"
         return await call_next(request)
+
+
+# Alt-Name fuer Backward-Compat falls andere Module den Namen referenzieren
+BearerAuthMiddleware = DualAuthMiddleware
 
 
 # ---------- Health Endpoint --------------------------------------------------
@@ -2514,6 +2571,13 @@ async def health(_: Request) -> JSONResponse:
             "vault_exists": vault.VAULT_PATH.exists(),
             "auth": "enabled" if _VALID_TOKENS else "DISABLED",
             "auth_legacy_active": bool(MCP_TOKEN_LEGACY),
+            "oauth": {
+                "enabled": oauth.is_configured(),
+                "issuer": oauth.OAUTH_ISSUER if oauth.is_configured() else None,
+                "user": oauth.OAUTH_USER_EMAIL if oauth.is_configured() else None,
+                "access_token_ttl": oauth.ACCESS_TOKEN_TTL,
+                "refresh_token_ttl": oauth.REFRESH_TOKEN_TTL,
+            },
             "tools": tools_count,
             "uptime_seconds": int(_t.time() - _BOOT_TIME),
             "rate_limit_per_min": int(os.environ.get("MCP_RATE_LIMIT_PER_MIN", "60")),
@@ -2716,18 +2780,22 @@ def create_app() -> Starlette:
                 pass
             audit.log_event("server_stop")
 
+    # Routes: health + OAuth-Endpoints (public, vor Auth-Middleware) + MCP (auth-protected)
+    routes_list = [
+        Route("/health", endpoint=health, methods=["GET"]),
+        *oauth_routes.routes(),  # .well-known/* + /oauth/*
+        # Beide Pfade ohne 307-Redirect (claude.ai BETA folgt nicht).
+        Mount("/mcp", app=mcp_app),
+        Mount("/mcp/", app=mcp_app),
+    ]
+
     app = Starlette(
         debug=False,
         middleware=[
-            Middleware(RateLimitMiddleware),  # OUTER: erst Rate-Limit ...
-            Middleware(BearerAuthMiddleware),  # ... dann Auth
+            Middleware(RateLimitMiddleware),   # OUTER: erst Rate-Limit ...
+            Middleware(DualAuthMiddleware),    # ... dann Auth (JWT oder Bearer)
         ],
-        routes=[
-            Route("/health", endpoint=health, methods=["GET"]),
-            # Beide Pfade ohne 307-Redirect (claude.ai BETA folgt nicht).
-            Mount("/mcp", app=mcp_app),
-            Mount("/mcp/", app=mcp_app),
-        ],
+        routes=routes_list,
         lifespan=lifespan,
     )
     app.router.redirect_slashes = False
@@ -2738,7 +2806,12 @@ def main() -> None:
     log.info("KI-OS MCP Server starting")
     log.info("  Vault: %s (exists=%s)", vault.VAULT_PATH, vault.VAULT_PATH.exists())
     log.info("  Bind:  %s:%d", MCP_HOST, MCP_PORT)
-    log.info("  Auth:  %s", "enabled" if MCP_TOKEN else "DISABLED (dev mode)")
+    log.info("  Auth:  Bearer=%s, OAuth=%s",
+             "enabled" if MCP_TOKEN else "DISABLED",
+             "enabled" if oauth.is_configured() else "DISABLED")
+    if oauth.is_configured():
+        log.info("  OAuth: issuer=%s, user=%s, db=%s",
+                 oauth.OAUTH_ISSUER, oauth.OAUTH_USER_EMAIL, oauth.OAUTH_DB_PATH)
     uvicorn.run(create_app(), host=MCP_HOST, port=MCP_PORT, log_level="info")
 
 
