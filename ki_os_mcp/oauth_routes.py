@@ -139,7 +139,7 @@ async def register(request: Request) -> JSONResponse:
     client_name = str(data.get("client_name") or "unnamed-client")[:120]
     redirect_uris = data.get("redirect_uris") or []
     try:
-        client = oauth.register_client(client_name, redirect_uris)
+        client = await oauth.register_client_async(client_name, redirect_uris)
     except ValueError as e:
         return JSONResponse({"error": "invalid_redirect_uri",
                              "error_description": str(e)}, status_code=400)
@@ -186,12 +186,12 @@ async def authorize_get(request: Request) -> Response:
         return HTMLResponse("<h1>invalid_request</h1>"
                             "<p>code_challenge fehlt — PKCE pflicht.</p>",
                             status_code=400)
-    client = oauth.get_client(client_id)
+    client = await oauth.get_client_async(client_id)
     if not client:
         return HTMLResponse(f"<h1>unauthorized_client</h1>"
                             f"<p>Unbekannte client_id <code>{_esc(client_id)}</code>. "
                             f"Erst /oauth/register aufrufen.</p>", status_code=400)
-    if not oauth.validate_redirect_uri(client_id, redirect_uri):
+    if not await oauth.validate_redirect_uri_async(client_id, redirect_uri):
         return HTMLResponse("<h1>invalid_redirect_uri</h1>"
                             "<p>redirect_uri stimmt nicht mit der Client-Registrierung ueberein.</p>",
                             status_code=400)
@@ -216,11 +216,11 @@ async def authorize_post(request: Request) -> Response:
     password = str(form.get("password") or "")
 
     # Re-validate alles weil Form könnte manipuliert sein
-    client = oauth.get_client(client_id)
-    if not client or not oauth.validate_redirect_uri(client_id, redirect_uri):
+    client = await oauth.get_client_async(client_id)
+    if not client or not await oauth.validate_redirect_uri_async(client_id, redirect_uri):
         return HTMLResponse("<h1>invalid_request</h1>", status_code=400)
 
-    if not oauth.verify_password(email, password):
+    if not await oauth.verify_password_async(email, password):
         # Wieder Login-Form mit Fehler — KEIN Account-Enumerate (gleicher Text fuer
         # falsche Email + falsches Pass)
         return HTMLResponse(_render_login(
@@ -275,7 +275,7 @@ async def _grant_authorization_code(form: Any) -> JSONResponse:
                             status_code=400)
 
     access, ttl = oauth.issue_access_token(entry["subject"], client_id, entry["scope"])
-    refresh = oauth.issue_refresh_token(client_id, entry["subject"], entry["scope"])
+    refresh = await oauth.issue_refresh_token_async(client_id, entry["subject"], entry["scope"])
     return JSONResponse({
         "access_token": access,
         "token_type": "Bearer",
@@ -291,7 +291,7 @@ async def _grant_refresh_token(form: Any) -> JSONResponse:
     if not (refresh and client_id):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    result = oauth.rotate_refresh_token(refresh, client_id)
+    result = await oauth.rotate_refresh_token_async(refresh, client_id)
     if not result:
         return JSONResponse({"error": "invalid_grant",
                              "error_description": "refresh_token abgelaufen, revoked oder replayed"},
@@ -314,7 +314,7 @@ async def revoke_endpoint(request: Request) -> Response:
     token = str(form.get("token") or "")
     if not token:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
-    oauth.revoke_refresh_token(token)
+    await oauth.revoke_refresh_token_async(token)
     # Spec: immer 200 OK auch bei unbekanntem Token (keine Token-Enumeration)
     return Response(status_code=200)
 

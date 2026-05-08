@@ -25,6 +25,7 @@ zuerst, faellt zurueck auf statisches Bearer-Token.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -402,3 +403,36 @@ def authorization_server_metadata() -> dict[str, Any]:
         "token_endpoint_auth_methods_supported": ["none"],
         "service_documentation": "https://github.com/julasim/KI_WIKI_MCP",
     }
+
+
+# ---------- Async-Wrapper fuer blocking calls -------------------------------
+# Werden aus async-Routen aufgerufen via `await asyncio.to_thread(...)`.
+# Ohne diese wrapper blockiert bcrypt + SQLite-I/O den event-loop unter Last.
+
+
+async def verify_password_async(email: str, password: str) -> bool:
+    return await asyncio.to_thread(verify_password, email, password)
+
+
+async def register_client_async(client_name: str, redirect_uris: list[str]) -> dict[str, Any]:
+    return await asyncio.to_thread(register_client, client_name, redirect_uris)
+
+
+async def get_client_async(client_id: str) -> dict[str, Any] | None:
+    return await asyncio.to_thread(get_client, client_id)
+
+
+async def validate_redirect_uri_async(client_id: str, redirect_uri: str) -> bool:
+    return await asyncio.to_thread(validate_redirect_uri, client_id, redirect_uri)
+
+
+async def issue_refresh_token_async(client_id: str, subject: str, scope: str) -> str:
+    return await asyncio.to_thread(issue_refresh_token, client_id, subject, scope)
+
+
+async def rotate_refresh_token_async(old_token: str, client_id: str) -> tuple[str, str, str] | None:
+    return await asyncio.to_thread(rotate_refresh_token, old_token, client_id)
+
+
+async def revoke_refresh_token_async(token_id: str) -> bool:
+    return await asyncio.to_thread(revoke_refresh_token, token_id)
