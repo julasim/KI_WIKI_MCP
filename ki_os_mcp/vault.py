@@ -207,9 +207,10 @@ def update_auto_notes_block(readme_path: Path, sections: dict[str, list[dict[str
         new_block = "\n".join(lines)
 
     if AUTO_NOTES_START in text and AUTO_NOTES_END in text:
-        # Existing block ersetzen
-        before = text.split(AUTO_NOTES_START)[0].rstrip()
-        after = text.split(AUTO_NOTES_END)[1].lstrip()
+        # Existing block ersetzen — robust gegen mehrfache Marker im File:
+        # split nur am ersten/letzten Marker, nicht an allen.
+        before = text.split(AUTO_NOTES_START, 1)[0].rstrip()
+        after = text.rsplit(AUTO_NOTES_END, 1)[1].lstrip()
         new_text = before + "\n\n" + new_block + ("\n\n" + after if after else "\n")
     else:
         # Append am Ende

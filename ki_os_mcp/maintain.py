@@ -391,12 +391,10 @@ def step_create_daily_skeleton(target_date: str | None = None) -> dict[str, Any]
     iso = target.isoformat()
     rel = f"10_Life/daily/{iso}.md"
     p = vault.safe_path(rel)
-    if p.exists():
-        return {"date": iso, "path": rel, "created": False, "reason": "already_exists"}
-
-    # Re-use vault._create_daily_skeleton (interner Helper) für identisches Format
+    # Kein exists()-Check vor O_EXCL — das ist die einzige Race-Free-Variante.
+    # Wir vertrauen O_EXCL: bei Existenz gibt's FileExistsError, sonst Datei
+    # wird atomic erzeugt. Damit kein TOCTOU.
     try:
-        # Atomar erzeugen via O_EXCL
         p.parent.mkdir(parents=True, exist_ok=True)
         # Skeleton-Content vorbereiten (gleiche Struktur wie vault._create_daily_skeleton)
         import yaml  # type: ignore
@@ -567,6 +565,20 @@ def step_goal_status_check() -> dict[str, Any]:
 # ---------- Pipeline-Driver ---------------------------------------------------
 
 
+def step_oauth_codes_cleanup() -> dict[str, Any]:
+    """Schritt: abgelaufene OAuth-Authorization-Codes aus dem in-memory Store
+    entfernen. Verhindert Memory-Leak bei Code-Issuing ohne Code-Consume.
+    """
+    try:
+        from ki_os_mcp import oauth
+        if not oauth.is_configured():
+            return {"removed": 0, "skipped": "oauth_disabled"}
+        n = oauth.cleanup_expired_codes()
+        return {"removed": n}
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def run_maintain(target_date: str | None = None) -> dict[str, Any]:
     """Führt die komplette Maintain-Pipeline aus.
 
@@ -594,6 +606,7 @@ def run_maintain(target_date: str | None = None) -> dict[str, Any]:
     _run_step("task_reactivate_recurring", step_task_reactivate_recurring)
     _run_step("create_daily_skeleton", step_create_daily_skeleton, None)
     _run_step("goal_status_check", step_goal_status_check)
+    _run_step("oauth_codes_cleanup", step_oauth_codes_cleanup)
     _run_step("lint_summary", step_lint_summary)
 
     duration_ms = round((time.perf_counter() - started_at) * 1000, 2)

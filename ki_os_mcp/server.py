@@ -2802,6 +2802,46 @@ def create_app() -> Starlette:
     return app
 
 
+def _boot_security_check() -> None:
+    """Startup-Validation: warnt bei schwacher Auth-Konfiguration.
+
+    Logs warnings statt zu crashen — Server startet trotzdem (z.B. Dev-Setup),
+    aber Operator sieht klar wenn was schwach ist.
+    """
+    # Bearer-Token-Length
+    if MCP_TOKEN and len(MCP_TOKEN) < 32:
+        log.warning(
+            "  ⚠ MCP_TOKEN nur %d chars (Min. empfohlen: 32). "
+            "Generiere via: python -c \"import secrets; print(secrets.token_urlsafe(32))\"",
+            len(MCP_TOKEN),
+        )
+
+    # Audit-Log-Pfad schreibbar?
+    audit_path = os.environ.get("MCP_AUDIT_LOG", "/var/log/mcp/audit.log")
+    audit_dir = os.path.dirname(audit_path) or "."
+    try:
+        os.makedirs(audit_dir, exist_ok=True)
+        # Test-write
+        test_file = os.path.join(audit_dir, ".write_test")
+        with open(test_file, "w") as f:
+            f.write("ok")
+        os.unlink(test_file)
+    except (OSError, PermissionError) as e:
+        log.warning("  ⚠ Audit-Log-Verzeichnis %s NICHT schreibbar (%s). "
+                    "Audit-Events gehen verloren!", audit_dir, e)
+
+    # OAuth-Strength
+    if oauth.is_configured():
+        ok_jwt, msg_jwt = oauth.is_jwt_secret_strong()
+        if not ok_jwt:
+            log.warning("  ⚠ JWT-Secret: %s", msg_jwt)
+        ok_pw, msg_pw = oauth.is_password_hash_strong()
+        if not ok_pw:
+            log.warning("  ⚠ Password-Hash: %s", msg_pw)
+        else:
+            log.info("  Password-Hash: %s", msg_pw)
+
+
 def main() -> None:
     log.info("KI-OS MCP Server starting")
     log.info("  Vault: %s (exists=%s)", vault.VAULT_PATH, vault.VAULT_PATH.exists())
@@ -2812,6 +2852,7 @@ def main() -> None:
     if oauth.is_configured():
         log.info("  OAuth: issuer=%s, user=%s, db=%s",
                  oauth.OAUTH_ISSUER, oauth.OAUTH_USER_EMAIL, oauth.OAUTH_DB_PATH)
+    _boot_security_check()
     uvicorn.run(create_app(), host=MCP_HOST, port=MCP_PORT, log_level="info")
 
 

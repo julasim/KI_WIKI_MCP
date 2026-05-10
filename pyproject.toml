@@ -4,14 +4,15 @@ version = "0.1.0"
 description = "KI-OS MCP Server — Vault-Tools für Claude Code & andere MCP-Clients"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.2.0",
-    "starlette>=0.37.0",
-    "uvicorn[standard]>=0.30.0",
-    "pyyaml>=6.0.1",
-    "python-frontmatter>=1.1.0",
-    # OAuth 2.1 (Phase X4 — claude.ai Connectors + andere Clients)
-    "pyjwt>=2.8.0",
-    "bcrypt>=4.1.0",
+    # Core MCP + ASGI — Major-Versionen gepinnt fuer Stabilitaet
+    "mcp[cli]>=1.2.0,<2.0",
+    "starlette>=0.37.0,<1.0",
+    "uvicorn[standard]>=0.30.0,<1.0",
+    "pyyaml>=6.0.1,<7.0",
+    "python-frontmatter>=1.1.0,<2.0",
+    # OAuth 2.1 — Major-bound damit Breaking-Changes nicht silent reinrutschen
+    "pyjwt>=2.8.0,<3.0",
+    "bcrypt>=4.1.0,<5.0",
 ]
 
 [build-system]

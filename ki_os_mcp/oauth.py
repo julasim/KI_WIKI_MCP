@@ -115,12 +115,42 @@ _conn: sqlite3.Connection | None = None
 
 
 def db() -> sqlite3.Connection:
+    """Lazy DB-Init mit Lock-Protected Singleton. Race-safe."""
     global _conn
-    if _conn is None:
-        with _db_lock:
-            if _conn is None:
-                _conn = _ensure_db()
-    return _conn
+    # Fast-path ohne lock wenn schon initialized — Lock-Akquisition ist teuer
+    local = _conn
+    if local is not None:
+        return local
+    with _db_lock:
+        # Re-check nach Lock-Acquire (anderer Thread kann mittlerweile init haben)
+        if _conn is None:
+            _conn = _ensure_db()
+        return _conn
+
+
+def is_jwt_secret_strong() -> tuple[bool, str]:
+    """Prueft beim Boot ob OAUTH_JWT_SECRET ausreichend lang ist."""
+    if not OAUTH_JWT_SECRET:
+        return False, "OAUTH_JWT_SECRET ist leer — OAuth nicht aktiv"
+    if len(OAUTH_JWT_SECRET) < 32:
+        return False, f"OAUTH_JWT_SECRET zu kurz ({len(OAUTH_JWT_SECRET)} chars, Min. 32). Generiere via: python -c 'import secrets; print(secrets.token_urlsafe(48))'"
+    return True, "ok"
+
+
+def is_password_hash_strong() -> tuple[bool, str]:
+    """Prueft beim Boot ob OAUTH_PASSWORD_HASH ein bcrypt mit min. 10 rounds ist."""
+    if not OAUTH_PASSWORD_HASH:
+        return False, "OAUTH_PASSWORD_HASH ist leer"
+    # bcrypt-Format: $2[abxy]$<rounds>$<22-char-salt><31-char-hash>
+    if not OAUTH_PASSWORD_HASH.startswith(("$2a$", "$2b$", "$2x$", "$2y$")):
+        return False, f"OAUTH_PASSWORD_HASH ist kein bcrypt-Format ({OAUTH_PASSWORD_HASH[:7]!r})"
+    try:
+        rounds = int(OAUTH_PASSWORD_HASH[4:6])
+    except ValueError:
+        return False, "OAUTH_PASSWORD_HASH: rounds nicht parsebar"
+    if rounds < 10:
+        return False, f"OAUTH_PASSWORD_HASH: nur {rounds} bcrypt-rounds (Min. empfohlen: 12)"
+    return True, f"ok (bcrypt rounds={rounds})"
 
 
 # ---------- In-Memory Authorization-Code Store ------------------------------
@@ -162,6 +192,20 @@ def issue_auth_code(client_id: str, redirect_uri: str,
         for k in [k for k, v in _auth_codes.items() if v["issued_at"] < cutoff]:
             del _auth_codes[k]
     return code
+
+
+def cleanup_expired_codes() -> int:
+    """Entfernt abgelaufene Auth-Codes aus dem in-memory Store.
+
+    Wird periodic vom Maintain-Scheduler gerufen (alle 10 Min). Verhindert
+    Memory-Leak falls jemand Codes ausgibt aber nie consumed.
+    """
+    cutoff = int(time.time()) - AUTH_CODE_TTL
+    with _codes_lock:
+        expired = [k for k, v in _auth_codes.items() if v["issued_at"] < cutoff]
+        for k in expired:
+            del _auth_codes[k]
+    return len(expired)
 
 
 def consume_auth_code(code: str, client_id: str, redirect_uri: str,
@@ -254,44 +298,68 @@ def rotate_refresh_token(old_token: str, client_id: str) -> tuple[str, str, str]
     Bei Replay-Detection (alter Token nochmal verwendet nachdem rotiert):
     revokt ALLE refresh-tokens des Subjects → Forced re-login. Spec-konformer
     Theft-Schutz (RFC 6819 §5.2.2.3).
+
+    Atomic via explicit BEGIN/COMMIT — bei Exception in der Mitte wird
+    rollback gemacht, Token-DB bleibt konsistent.
     """
+    new_token: str | None = None
+    subject: str | None = None
+    scope: str | None = None
+
     with _db_lock:
-        cursor = db().execute(
-            "SELECT subject, scope, expires_at, revoked, replaced_by FROM refresh_tokens "
-            "WHERE token_id = ? AND client_id = ?",
-            (old_token, client_id),
-        )
-        row = cursor.fetchone()
-        if row is None:
-            return None
-        subject, scope, expires_at, revoked, replaced_by = row
-
-        now = int(time.time())
-        if now >= expires_at:
-            return None
-
-        if revoked or replaced_by:
-            # Replay! Alter Token wurde schon einmal gerotated.
-            # → ALLE Tokens des Subjects revoken (Theft-Schutz)
-            log.warning("Refresh-Token Replay erkannt subject=%s — alle Tokens revoked", subject)
-            db().execute(
-                "UPDATE refresh_tokens SET revoked = 1 WHERE subject = ? AND revoked = 0",
-                (subject,),
+        conn = db()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cursor = conn.execute(
+                "SELECT subject, scope, expires_at, revoked, replaced_by FROM refresh_tokens "
+                "WHERE token_id = ? AND client_id = ?",
+                (old_token, client_id),
             )
-            return None
+            row = cursor.fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return None
+            subject_db, scope_db, expires_at, revoked, replaced_by = row
 
-        # OK — alten Token revoken, neuen ausgeben
-        new_token = secrets.token_urlsafe(48)
-        db().execute(
-            "INSERT INTO refresh_tokens (token_id, client_id, subject, scope, issued_at, expires_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (new_token, client_id, subject, scope, now, now + REFRESH_TOKEN_TTL),
-        )
-        db().execute(
-            "UPDATE refresh_tokens SET revoked = 1, replaced_by = ? WHERE token_id = ?",
-            (new_token, old_token),
-        )
+            now = int(time.time())
+            if now >= expires_at:
+                conn.execute("ROLLBACK")
+                return None
 
+            if revoked or replaced_by:
+                # Replay! → ALLE Tokens des Subjects revoken (Theft-Schutz)
+                log.warning("Refresh-Token Replay erkannt subject=%s — alle Tokens revoked", subject_db)
+                conn.execute(
+                    "UPDATE refresh_tokens SET revoked = 1 WHERE subject = ? AND revoked = 0",
+                    (subject_db,),
+                )
+                conn.execute("COMMIT")
+                return None
+
+            # OK — alten Token revoken, neuen ausgeben (BEIDE in einer TX)
+            new_token = secrets.token_urlsafe(48)
+            subject = subject_db
+            scope = scope_db
+            conn.execute(
+                "INSERT INTO refresh_tokens (token_id, client_id, subject, scope, issued_at, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (new_token, client_id, subject, scope, now, now + REFRESH_TOKEN_TTL),
+            )
+            conn.execute(
+                "UPDATE refresh_tokens SET revoked = 1, replaced_by = ? WHERE token_id = ?",
+                (new_token, old_token),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            log.exception("rotate_refresh_token DB-Fehler — rollback")
+            raise
+
+    if new_token is None or subject is None or scope is None:
+        return None
     new_access, _ = issue_access_token(subject, client_id, scope)
     return (new_access, new_token, scope)
 
