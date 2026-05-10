@@ -323,6 +323,129 @@ def validate_get_outline(path: str, include_tables: bool) -> str | None:
     return None
 
 
+# ---------- Phase-X5 Refactoring + Maintenance Tools -------------------------
+
+
+def validate_list_snapshots(
+    rel_path: str | None, since: str | None, until: str | None,
+    op: str | None, limit: int,
+) -> str | None:
+    if rel_path is not None and not isinstance(rel_path, str):
+        return _err("rel_path", "muss str oder None sein")
+    if since and (e := _check_iso_date(since, "since")): return e
+    if until and (e := _check_iso_date(until, "until")): return e
+    if op is not None and (not isinstance(op, str) or not op.strip()):
+        return _err("op", "wenn gesetzt: nicht-leerer String")
+    if not isinstance(limit, int) or limit < 1 or limit > 500:
+        return _err("limit", "int 1..500")
+    return None
+
+
+def validate_restore_snapshot(
+    snapshot_id: str, target_path: str | None
+) -> str | None:
+    if e := _check_string_required(snapshot_id, "snapshot_id"): return e
+    # Format: YYYY-MM-DD/HH-MM-SS_<op>_<slug>.tar.gz
+    if not re.match(r"^\d{4}-\d{2}-\d{2}/\d{2}-\d{2}-\d{2}_[a-z_]+_[a-z0-9\-]+\.tar\.gz$",
+                    snapshot_id):
+        return _err("snapshot_id", f"Format-Mismatch: {snapshot_id!r}")
+    if target_path is not None and not isinstance(target_path, str):
+        return _err("target_path", "muss str oder None sein")
+    return None
+
+
+def validate_append_under_heading(
+    path: str, heading: str, content: str, position: str, create_if_missing: bool,
+) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if not path.endswith(".md"):
+        return _err("path", "nur fuer .md-Files")
+    if e := _check_string_required(heading, "heading"): return e
+    if len(heading) > 200:
+        return _err("heading", f"zu lang ({len(heading)} > 200)")
+    if e := _check_string_required(content, "content"): return e
+    if len(content) > 100_000:
+        return _err("content", f"zu lang ({len(content)} > 100KB)")
+    if position not in ("start", "end"):
+        return _err("position", "erlaubt: 'start' | 'end'")
+    if not isinstance(create_if_missing, bool):
+        return _err("create_if_missing", "muss bool sein")
+    return None
+
+
+def validate_split_file(
+    path: str, at_heading: str, new_path: str, copy_frontmatter: bool,
+) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if not path.endswith(".md"):
+        return _err("path", "nur fuer .md-Files")
+    if e := _check_string_required(at_heading, "at_heading"): return e
+    if e := _check_string_required(new_path, "new_path"): return e
+    if not new_path.endswith(".md"):
+        return _err("new_path", "muss .md sein")
+    if path == new_path:
+        return _err("new_path", "darf nicht identisch mit path sein")
+    if not isinstance(copy_frontmatter, bool):
+        return _err("copy_frontmatter", "muss bool sein")
+    return None
+
+
+def validate_merge_files(
+    sources: list[str], target: str, mode: str, separator: str, delete_sources: bool,
+) -> str | None:
+    if not isinstance(sources, list) or not sources:
+        return _err("sources", "muss nicht-leere Liste sein")
+    if len(sources) > 50:
+        return _err("sources", f"max 50 Files pro Merge ({len(sources)})")
+    for i, s in enumerate(sources):
+        if not isinstance(s, str) or not s.strip():
+            return _err(f"sources[{i}]", "leerer/nicht-string Eintrag")
+        if not s.endswith(".md"):
+            return _err(f"sources[{i}]", "nur .md-Files")
+    if e := _check_string_required(target, "target"): return e
+    if not target.endswith(".md"):
+        return _err("target", "muss .md sein")
+    if target in sources:
+        return _err("target", "target darf nicht in sources sein")
+    if mode not in ("append", "prepend"):
+        return _err("mode", "erlaubt: 'append' | 'prepend'")
+    if not isinstance(separator, str):
+        return _err("separator", "muss str sein (auch leer erlaubt)")
+    if len(separator) > 200:
+        return _err("separator", "max 200 chars")
+    if not isinstance(delete_sources, bool):
+        return _err("delete_sources", "muss bool sein")
+    return None
+
+
+def validate_apply_template(
+    template_path: str, target_path: str, vars: dict[str, Any] | None,
+    overwrite: bool,
+) -> str | None:
+    if e := _check_string_required(template_path, "template_path"): return e
+    if not template_path.endswith(".md"):
+        return _err("template_path", "muss .md sein")
+    if e := _check_string_required(target_path, "target_path"): return e
+    if not target_path.endswith(".md"):
+        return _err("target_path", "muss .md sein")
+    if template_path == target_path:
+        return _err("target_path", "darf nicht identisch mit template_path sein")
+    if vars is not None:
+        if not isinstance(vars, dict):
+            return _err("vars", "muss dict oder None sein")
+        for k, v in vars.items():
+            if not isinstance(k, str) or not k.strip():
+                return _err("vars", f"Var-Key muss nicht-leerer String sein: {k!r}")
+            # Variablen-Werte: alles was str() vertraegt ist OK
+            if isinstance(v, (dict, list)) and any(
+                isinstance(x, (dict, list)) for x in (v.values() if isinstance(v, dict) else v)
+            ):
+                return _err("vars", f"Var-Werte duerfen nicht verschachtelt sein: {k}")
+    if not isinstance(overwrite, bool):
+        return _err("overwrite", "muss bool sein")
+    return None
+
+
 def validate_append_table_row(
     path: str, values: list[str], heading: str | None
 ) -> str | None:

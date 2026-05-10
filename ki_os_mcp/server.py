@@ -21,6 +21,8 @@ import os
 import re
 import shutil
 from contextlib import asynccontextmanager
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 import frontmatter
@@ -3040,6 +3042,481 @@ def get_outline(path: str, include_tables: bool = False) -> dict[str, Any]:
     return result
 
 
+# ---------- Phase-X5 Refactoring + Maintenance ------------------------------
+# 6 Tools fuer Recovery, generelles Append, File-Splitting/Merging, Templates.
+
+
+@mcp.tool()
+def list_snapshots(
+    rel_path: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    op: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Listet Backup-Snapshots, optional gefiltert.
+
+    Snapshots werden vor jedem destruktiven Tool angelegt (edit_file,
+    edit_file_replace, raw_write, move, delete, append_table_row).
+
+    Args:
+        rel_path: Nur Snapshots, die diesen Vault-Pfad enthalten (oeffnet tar)
+        since: ISO-Datum (YYYY-MM-DD), nur Snapshots ab diesem Tag
+        until: ISO-Datum (YYYY-MM-DD), nur Snapshots bis incl. diesem Tag
+        op: Operation-Filter (z.B. "edit", "edit_replace", "move")
+        limit: Max-Anzahl (default 50, max 500)
+
+    Returns:
+        {total, filter, snapshots: [{snapshot_id, day, time, op, slug, size, mtime, files?}]}
+        files-Feld nur wenn rel_path-Filter aktiv war.
+    """
+    if err := validators.validate_list_snapshots(rel_path, since, until, op, limit):
+        raise ToolError(err)
+    snaps = snapshot.list_snapshots(
+        rel_path=rel_path, since=since, until=until, op=op, limit=limit,
+    )
+    return {
+        "total": len(snaps),
+        "filter": {
+            "rel_path": rel_path, "since": since, "until": until,
+            "op": op, "limit": limit,
+        },
+        "snapshots": snaps,
+    }
+
+
+@mcp.tool()
+def restore_snapshot(
+    snapshot_id: str,
+    target_path: str | None = None,
+) -> dict[str, Any]:
+    """Stellt Files aus einem Snapshot wieder her (ueberschreibt aktuelle).
+
+    Vor der Restore-Operation wird ein NEUER Snapshot der aktuellen Files
+    angelegt — Recovery ist also auch wieder rueckgaengig zu machen.
+
+    Args:
+        snapshot_id: Format `<YYYY-MM-DD>/<HH-MM-SS>_<op>_<slug>.tar.gz`
+                     (aus list_snapshots)
+        target_path: Wenn gesetzt: NUR dieses File aus dem Snapshot zurueckholen.
+                     None: alle Files im Snapshot wiederherstellen.
+
+    Returns:
+        {snapshot_id, restored: [{path, bytes_written, existed_before}],
+         pre_restore_snapshot}
+    """
+    if err := validators.validate_restore_snapshot(snapshot_id, target_path):
+        raise ToolError(err)
+
+    # Pre-restore-Snapshot der aktuell betroffenen Files (so vorhanden)
+    pre_files: dict[str, bytes] = {}
+    try:
+        # Erst rausfinden welche Files DER snapshot enthaelt
+        target_tar = (snapshot.SNAPSHOT_DIR / snapshot_id).resolve()
+        if target_tar.is_file():
+            import tarfile as _tf
+            with _tf.open(target_tar, "r:gz") as tar:
+                for m in tar.getmembers():
+                    if not m.isfile():
+                        continue
+                    rel = m.name
+                    if target_path and rel != target_path:
+                        continue
+                    try:
+                        full = vault.safe_path(rel)
+                    except VaultError:
+                        continue
+                    if full.is_file():
+                        pre_files[rel] = full.read_bytes()
+    except (OSError, Exception) as e:  # noqa: BLE001
+        log.warning("Pre-restore snapshot read failed: %s", e)
+
+    pre_id: str | None = None
+    if pre_files:
+        pre_id = snapshot.snapshot("pre_restore", pre_files)
+
+    try:
+        restored = snapshot.restore_snapshot(
+            snapshot_id, target_path=target_path, vault_root=vault.VAULT_PATH,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        raise ToolError(str(e))
+    except OSError as e:
+        raise ToolError(f"Restore failed: {e}")
+
+    return {
+        "snapshot_id": snapshot_id,
+        "restored": restored,
+        "total_restored": len(restored),
+        "pre_restore_snapshot": pre_id,
+    }
+
+
+@mcp.tool()
+def append_under_heading(
+    path: str,
+    heading: str,
+    content: str,
+    position: str = "end",
+    create_if_missing: bool = False,
+) -> dict[str, Any]:
+    """Haengt Text unter eine bestimmte Heading-Section an.
+
+    Verallgemeinerung von `append_to_daily` — funktioniert mit jeder Datei
+    und jeder Heading. Format-erhaltend, Snapshot vor Write.
+
+    Section = von der Heading-Zeile bis zur naechsten Heading mit gleichem
+    oder hoeherem Level. Wenn create_if_missing=True und die Heading nicht
+    existiert: wird am Datei-Ende als H2 ergaenzt.
+
+    Args:
+        path: Rel-Pfad zur .md-Datei
+        heading: Substring (case-insensitive) der Ziel-Heading
+        content: Text der angehaengt werden soll (Markdown erlaubt)
+        position: 'end' (vor naechster Heading) oder 'start' (direkt nach
+                  Heading-Line)
+        create_if_missing: Wenn Heading fehlt, am Datei-Ende ergaenzen
+
+    Returns:
+        {path, heading_matched, position, lines_inserted, snapshot}
+    """
+    if err := validators.validate_append_under_heading(
+        path, heading, content, position, create_if_missing
+    ):
+        raise ToolError(err)
+    try:
+        post = vault.read_post(path)
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    body = post.content
+    lines = body.split("\n")
+    rng = vault.find_heading_range(lines, heading)
+
+    matched_heading: str | None = None
+    if rng is None:
+        if not create_if_missing:
+            raise ToolError(f"Heading nicht gefunden: {heading!r}")
+        # Heading am Datei-Ende ergaenzen, dann content darunter
+        new_heading_line = f"## {heading.strip()}"
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(new_heading_line)
+        lines.append("")
+        h_idx = len(lines) - 2  # Position der Heading
+        end_idx = len(lines)
+        matched_heading = heading.strip()
+    else:
+        h_idx, end_idx = rng
+        matched_heading = lines[h_idx].lstrip("#").strip()
+
+    content_lines = content.rstrip("\n").split("\n")
+
+    if position == "start":
+        # Nach der Heading-Zeile + ggf. einer Leerzeile einfuegen
+        insert_at = h_idx + 1
+        # Skip eine direkt folgende Leerzeile damit Content sauber unter Heading sitzt
+        if insert_at < len(lines) and lines[insert_at].strip() == "":
+            insert_at += 1
+        # Sicherstellen dass nach Content eine Leerzeile folgt
+        if insert_at < len(lines) and lines[insert_at].strip() != "":
+            content_lines = content_lines + [""]
+    else:  # end
+        # Direkt vor end_idx; trailing Leerzeilen am Section-Ende ueberspringen
+        insert_at = end_idx
+        while insert_at > h_idx + 1 and lines[insert_at - 1].strip() == "":
+            insert_at -= 1
+        # Eine Leerzeile vor Content (Trennung zur vorherigen Section-Inhalt)
+        if insert_at > h_idx + 1 and lines[insert_at - 1].strip():
+            content_lines = [""] + content_lines
+
+    # Snapshot
+    before_bytes = vault.safe_path(path).read_bytes()
+    snapshot.snapshot_path(path, before_bytes, "append_under_heading")
+
+    # Insert
+    new_lines = lines[:insert_at] + content_lines + lines[insert_at:]
+    post.content = "\n".join(new_lines)
+    vault.write_post(path, post)
+
+    return {
+        "path": path,
+        "heading_matched": matched_heading,
+        "position": position,
+        "lines_inserted": len(content_lines),
+        "created_heading": rng is None,
+    }
+
+
+@mcp.tool()
+def split_file(
+    path: str,
+    at_heading: str,
+    new_path: str,
+    copy_frontmatter: bool = True,
+) -> dict[str, Any]:
+    """Splittet eine Markdown-Datei: Section unter `at_heading` wandert nach `new_path`.
+
+    Source behaelt alles AUSSER der genannten Section.
+    Target bekommt nur die Section (Heading + Inhalt bis naechste gleiche/hoehere Heading).
+
+    Args:
+        path: Source-Datei
+        at_heading: Substring der Heading, deren Section abgespalten wird
+        new_path: Ziel-Pfad (darf nicht existieren)
+        copy_frontmatter: Wenn True, FM von Source nach Target kopieren
+                          (id wird angepasst auf new_path-stem)
+
+    Returns:
+        {source_path, target_path, source_lines_remaining, target_lines, snapshot}
+    """
+    if err := validators.validate_split_file(path, at_heading, new_path, copy_frontmatter):
+        raise ToolError(err)
+
+    try:
+        source_post = vault.read_post(path)
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    target_p = vault.safe_path(new_path)
+    if target_p.exists():
+        raise ToolError(f"Target existiert bereits: {new_path}")
+
+    body = source_post.content
+    lines = body.split("\n")
+    rng = vault.find_heading_range(lines, at_heading)
+    if rng is None:
+        raise ToolError(f"Heading nicht gefunden: {at_heading!r}")
+    h_idx, end_idx = rng
+
+    section_lines = lines[h_idx:end_idx]
+    remaining_lines = lines[:h_idx] + lines[end_idx:]
+
+    # Trailing-Leerzeile am Cut-Point bereinigen
+    while remaining_lines and remaining_lines[-1].strip() == "" and len(remaining_lines) > 1:
+        if not remaining_lines[-2].strip():
+            remaining_lines.pop()
+        else:
+            break
+
+    # Snapshot Source vor Schreibvorgang
+    before_bytes = vault.safe_path(path).read_bytes()
+    snapshot.snapshot_path(path, before_bytes, "split_source")
+
+    # Target schreiben
+    import frontmatter as _fm
+    target_post = _fm.Post("\n".join(section_lines).strip() + "\n")
+    if copy_frontmatter:
+        for k, v in source_post.metadata.items():
+            target_post[k] = v
+        # ID auf new_path-stem aktualisieren
+        target_post["id"] = Path(new_path).stem
+        target_post["title"] = lines[h_idx].lstrip("#").strip() or Path(new_path).stem
+    target_post["created"] = vault.today_iso()
+    vault.write_post(new_path, target_post)
+
+    # Source aktualisieren
+    source_post.content = "\n".join(remaining_lines)
+    vault.write_post(path, source_post)
+
+    return {
+        "source_path": path,
+        "target_path": new_path,
+        "source_lines_remaining": len(remaining_lines),
+        "target_lines": len(section_lines),
+    }
+
+
+@mcp.tool()
+def merge_files(
+    sources: list[str],
+    target: str,
+    mode: str = "append",
+    separator: str = "\n\n---\n\n",
+    delete_sources: bool = False,
+) -> dict[str, Any]:
+    """Mergt mehrere Files in eines.
+
+    Frontmatter: Target's FM bleibt erhalten; Source-FM wird ignoriert
+    (es waere ohnehin Konflikt-anfaellig). Tags der Sources werden
+    in Target-tags-Liste deduped gemerged.
+
+    Args:
+        sources: Rel-Pfade der Quell-Files
+        target: Ziel-Datei (muss existieren)
+        mode: 'append' (Sources nach Target-Body) | 'prepend' (vor Target-Body)
+        separator: zwischen Bodies (default `\\n\\n---\\n\\n`)
+        delete_sources: Sources nach erfolgreichem Merge loeschen (mit Snapshot)
+
+    Returns:
+        {target, sources_merged, total_bodies_appended, deleted: [paths], snapshot}
+    """
+    if err := validators.validate_merge_files(sources, target, mode, separator, delete_sources):
+        raise ToolError(err)
+
+    # Target lesen
+    try:
+        target_post = vault.read_post(target)
+    except VaultError as e:
+        raise ToolError(f"Target nicht lesbar: {e}")
+
+    # Sources lesen + sammeln
+    source_bodies: list[str] = []
+    source_tags: set[str] = set()
+    valid_sources: list[str] = []
+    for s in sources:
+        try:
+            sp = vault.read_post(s)
+        except VaultError as e:
+            raise ToolError(f"Source nicht lesbar: {s} ({e})")
+        source_bodies.append(sp.content.strip())
+        valid_sources.append(s)
+        s_tags = sp.metadata.get("tags") or []
+        if isinstance(s_tags, list):
+            source_tags.update(t for t in s_tags if isinstance(t, str))
+
+    # Snapshots: Target + alle Sources
+    files_for_snapshot: dict[str, bytes] = {}
+    files_for_snapshot[target] = vault.safe_path(target).read_bytes()
+    for s in valid_sources:
+        files_for_snapshot[s] = vault.safe_path(s).read_bytes()
+    snap = snapshot.snapshot("merge", files_for_snapshot)
+
+    # Body zusammenbauen
+    target_body = target_post.content.strip()
+    sources_combined = separator.join(source_bodies)
+    if mode == "append":
+        new_body = target_body + ("\n\n" if target_body else "") + sources_combined + "\n"
+    else:  # prepend
+        new_body = sources_combined + ("\n\n" if sources_combined else "") + target_body + "\n"
+
+    # Tags mergen (deduped)
+    existing_tags = target_post.metadata.get("tags") or []
+    if isinstance(existing_tags, list):
+        merged_tags = list(dict.fromkeys(existing_tags + sorted(source_tags)))
+        target_post["tags"] = merged_tags
+
+    target_post.content = new_body
+    vault.write_post(target, target_post)
+
+    deleted: list[str] = []
+    if delete_sources:
+        for s in valid_sources:
+            try:
+                vault.delete_file(s)
+                deleted.append(s)
+            except VaultError as e:
+                log.warning("merge_files: delete %s failed: %s", s, e)
+
+    return {
+        "target": target,
+        "sources_merged": valid_sources,
+        "total_bodies_appended": len(source_bodies),
+        "deleted": deleted,
+        "snapshot": snap,
+    }
+
+
+@mcp.tool()
+def apply_template(
+    template_path: str,
+    target_path: str,
+    vars: dict[str, Any] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Kopiert ein Template-File mit Variablen-Substitution nach target_path.
+
+    Variablen-Syntax: `{{var}}` oder `{{var:default}}`
+
+    Auto-Vars (immer verfuegbar, koennen ueberschrieben werden):
+        date     — heute, ISO YYYY-MM-DD
+        time     — jetzt, HH:MM
+        title    — target_path stem (Filename ohne .md)
+        slug     — slugify(title)
+        timestamp — ISO YYYY-MM-DDTHH:MM:SS
+
+    Substitution erfolgt in Frontmatter UND Body. Nicht-aufgeloeste
+    Variablen ohne Default lassen das `{{var}}` stehen + warnen.
+
+    Args:
+        template_path: Rel-Pfad zum Template (.md mit Vars)
+        target_path: Ziel-Pfad (.md)
+        vars: Custom-Variablen, ueberschreibt Auto-Vars
+        overwrite: True um existierende Target-Datei zu ersetzen
+
+    Returns:
+        {target_path, template_path, vars_used, vars_unresolved, overwritten}
+    """
+    if err := validators.validate_apply_template(
+        template_path, target_path, vars, overwrite
+    ):
+        raise ToolError(err)
+
+    try:
+        tpl_text = vault.read_text(template_path)
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    target_full = vault.safe_path(target_path)
+    target_existed = target_full.exists()
+    if target_existed and not overwrite:
+        raise ToolError(
+            f"Target existiert: {target_path}. overwrite=true setzen um zu ersetzen."
+        )
+
+    # Auto-Vars
+    now = datetime.now()
+    auto_vars: dict[str, str] = {
+        "date": vault.today_iso(),
+        "time": now.strftime("%H:%M"),
+        "title": Path(target_path).stem,
+        "slug": vault.slugify(Path(target_path).stem),
+        "timestamp": now.isoformat(timespec="seconds"),
+    }
+    merged_vars: dict[str, Any] = dict(auto_vars)
+    if vars:
+        for k, v in vars.items():
+            merged_vars[k] = v
+
+    # Substitution: {{var}} und {{var:default}}
+    var_re = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?::([^}]*))?\}\}")
+    used: set[str] = set()
+    unresolved: set[str] = set()
+
+    def _sub(m: re.Match[str]) -> str:
+        key = m.group(1)
+        default = m.group(2)
+        if key in merged_vars:
+            used.add(key)
+            return str(merged_vars[key])
+        if default is not None:
+            used.add(key)
+            return default.strip()
+        unresolved.add(key)
+        return m.group(0)  # Lassen wie es war
+
+    rendered = var_re.sub(_sub, tpl_text)
+
+    # Snapshot wenn ueberschrieben
+    if target_existed:
+        try:
+            snapshot.snapshot_path(target_path, target_full.read_bytes(), "apply_template")
+        except OSError:
+            pass
+
+    target_full.parent.mkdir(parents=True, exist_ok=True)
+    target_full.write_text(rendered, encoding="utf-8")
+
+    return {
+        "target_path": target_path,
+        "template_path": template_path,
+        "vars_used": sorted(used),
+        "vars_unresolved": sorted(unresolved),
+        "overwritten": target_existed,
+        "size_bytes": len(rendered.encode("utf-8")),
+    }
+
+
 @mcp.tool()
 def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
     """Schreibt rohen Text in ein File (ohne Frontmatter, ohne Schema).
@@ -3326,6 +3803,13 @@ TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     "vault_maintain":             {"idempotentHint": True, "openWorldHint": False, "title": "Self-Maintenance Pipeline"},
     "task_reactivate_recurring":  {"idempotentHint": True, "openWorldHint": False, "title": "Recurring-Tasks reaktivieren"},
     "create_daily_skeleton":      {"idempotentHint": True, "openWorldHint": False, "title": "Daily-Skeleton vorbereiten"},
+    # --- Phase-X5: Recovery + Refactoring ---
+    "list_snapshots":             {"readOnlyHint": True, "openWorldHint": False, "title": "Snapshots auflisten"},
+    "restore_snapshot":           {"destructiveHint": True, "openWorldHint": False, "title": "Snapshot wiederherstellen"},
+    "append_under_heading":       {"destructiveHint": False, "openWorldHint": False, "title": "Unter Heading anhaengen"},
+    "split_file":                 {"destructiveHint": True, "openWorldHint": False, "title": "Datei an Heading splitten"},
+    "merge_files":                {"destructiveHint": True, "openWorldHint": False, "title": "Dateien zusammenfuehren"},
+    "apply_template":             {"destructiveHint": False, "openWorldHint": False, "title": "Template anwenden"},
 }
 
 

@@ -343,6 +343,59 @@ def extract_headings(text: str) -> list[dict[str, Any]]:
     return out
 
 
+def find_heading_range(lines: list[str], heading: str) -> tuple[int, int] | None:
+    """Findet die Zeilen-Range einer Heading-Section.
+
+    Args:
+        lines: body als list[str] (split by "\n")
+        heading: Substring (case-insensitive) der zu findenden Heading
+
+    Returns:
+        (heading_line_idx, end_idx) — heading_line_idx zeigt auf die `## Heading`
+        Zeile selbst, end_idx ist die letzte Zeile DER Section (exklusiv: erste
+        Zeile NACH der Section, oder len(lines) wenn Section bis Datei-Ende geht).
+
+        Section-Ende = naechste Heading mit gleichem oder hoeherem Level (= kleinere
+        Zahl an `#`).
+
+        None wenn Heading nicht gefunden.
+    """
+    target = heading.strip().lower()
+    in_code = False
+    h_idx = -1
+    h_level = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        m = _HEADING_RE.match(line)
+        if m and target in m.group(2).strip().lower():
+            h_idx = i
+            h_level = len(m.group(1))
+            break
+    if h_idx < 0:
+        return None
+
+    # End finden: naechste Heading mit lvl <= h_level
+    end_idx = len(lines)
+    in_code = False
+    for j in range(h_idx + 1, len(lines)):
+        s = lines[j].strip()
+        if s.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        m = _HEADING_RE.match(lines[j])
+        if m and len(m.group(1)) <= h_level:
+            end_idx = j
+            break
+    return h_idx, end_idx
+
+
 def file_id(rel: str) -> str | None:
     """Aufloesen path → id. Erst Frontmatter `id`, sonst filename ohne `.md`.
 
