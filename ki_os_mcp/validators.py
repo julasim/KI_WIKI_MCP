@@ -243,3 +243,24 @@ def validate_create_project(name: str, parent: str | None) -> str | None:
     if parent is not None and not isinstance(parent, str):
         return _err("parent", "muss str oder None sein")
     return None
+
+
+def validate_append_table_row(
+    path: str, values: list[str], heading: str | None
+) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if not path.endswith(".md"):
+        return _err("path", "append_table_row nur fuer .md-Files")
+    if not isinstance(values, list) or not values:
+        return _err("values", "muss nicht-leere Liste sein")
+    for i, v in enumerate(values):
+        if not isinstance(v, str):
+            return _err(f"values[{i}]", f"muss String sein (bekommen: {type(v).__name__})")
+        if len(v) > 2000:
+            return _err(f"values[{i}]", f"zu lang ({len(v)} > 2000 Zeichen)")
+    if heading is not None:
+        if not isinstance(heading, str) or not heading.strip():
+            return _err("heading", "muss nicht-leerer String sein wenn gesetzt")
+        if len(heading) > 200:
+            return _err("heading", f"zu lang ({len(heading)} > 200 Zeichen)")
+    return None

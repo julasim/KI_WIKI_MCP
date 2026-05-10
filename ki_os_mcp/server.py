@@ -634,6 +634,233 @@ def edit_file_replace(
     }
 
 
+# ---------- append_table_row -------------------------------------------------
+# Format-erhaltendes Append in eine bestehende Markdown-Tabelle.
+# Verhindert die LLM-Failure-Mode "Bot prepended Prosa-Block statt Table-Row".
+
+_TABLE_SEP_CELL = re.compile(r"^:?-+:?$")
+
+
+def _is_table_separator(line: str) -> bool:
+    """True wenn Zeile ein GFM-Tabellen-Separator ist: `|---|---|` oder `|:--|--:|`."""
+    s = line.strip()
+    if not s.startswith("|") or not s.endswith("|"):
+        return False
+    cells = [c.strip() for c in s[1:-1].split("|")]
+    if not cells:
+        return False
+    return all(_TABLE_SEP_CELL.fullmatch(c) for c in cells)
+
+
+def _is_table_row(line: str) -> bool:
+    """True wenn Zeile aussieht wie Tabellen-Zeile (Pipe am Anfang+Ende, kein Separator)."""
+    s = line.strip()
+    return s.startswith("|") and s.endswith("|") and not _is_table_separator(line)
+
+
+def _heading_level(line: str) -> int:
+    """Returnt 1-6 fuer #..######, sonst 0."""
+    s = line.lstrip()
+    if not s.startswith("#"):
+        return 0
+    n = 0
+    for ch in s:
+        if ch == "#":
+            n += 1
+        else:
+            break
+    if n > 6 or n == 0:
+        return 0
+    if len(s) > n and s[n] != " ":
+        return 0  # `#word` ist kein Heading
+    return n
+
+
+def _heading_text(line: str) -> str:
+    """Extrahiert Heading-Text ohne #-Praefix."""
+    return line.lstrip().lstrip("#").strip()
+
+
+def _find_table(lines: list[str], heading: str | None) -> tuple[int, int, int]:
+    """Findet eine Tabelle im body.
+
+    Returns:
+        (header_idx, sep_idx, n_cols) — Indizes in `lines`, Spaltenzahl.
+
+    Raises:
+        ValueError mit klarer Message wenn keine/mehrere Tabellen.
+    """
+    # 1) Search-Range bestimmen
+    if heading:
+        target = heading.strip().lower()
+        h_idx = -1
+        h_level = 0
+        for i, line in enumerate(lines):
+            lvl = _heading_level(line)
+            if lvl > 0 and target in _heading_text(line).lower():
+                h_idx = i
+                h_level = lvl
+                break
+        if h_idx < 0:
+            raise ValueError(f"Heading nicht gefunden: {heading!r}")
+        # Range: nach Heading bis zur naechsten Heading mit <= level
+        start = h_idx + 1
+        end = len(lines)
+        for j in range(start, len(lines)):
+            lvl = _heading_level(lines[j])
+            if 0 < lvl <= h_level:
+                end = j
+                break
+    else:
+        start, end = 0, len(lines)
+
+    # 2) Tabellen finden: Header-Zeile + direkt folgende Separator-Zeile
+    tables: list[tuple[int, int]] = []
+    i = start
+    while i < end - 1:
+        if _is_table_row(lines[i]) and _is_table_separator(lines[i + 1]):
+            tables.append((i, i + 1))
+            # skip past data rows
+            j = i + 2
+            while j < end and _is_table_row(lines[j]):
+                j += 1
+            i = j
+        else:
+            i += 1
+
+    if not tables:
+        scope = f"unter Heading {heading!r}" if heading else "im File"
+        raise ValueError(f"Keine Markdown-Tabelle gefunden {scope}")
+    if len(tables) > 1 and not heading:
+        raise ValueError(
+            f"Mehrere Tabellen gefunden ({len(tables)}). "
+            f"Bitte `heading` setzen zum Disambiguieren."
+        )
+
+    header_idx, sep_idx = tables[0]
+    # Spaltenzahl aus Header
+    header_cells = [c for c in lines[header_idx].strip()[1:-1].split("|")]
+    return header_idx, sep_idx, len(header_cells)
+
+
+def _escape_cell(value: str) -> str:
+    """Escapen fuer Markdown-Tabellen-Zelle."""
+    return (
+        value.replace("\r\n", "\n")
+        .replace("\r", "")
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\n", "<br>")
+        .strip()
+    )
+
+
+@mcp.tool()
+def append_table_row(
+    path: str,
+    values: list[str],
+    heading: str | None = None,
+) -> dict[str, Any]:
+    """Fuegt eine Zeile an eine bestehende Markdown-Tabelle.
+
+    Bevorzugte Methode fuer Listen-/Stunden-/Inventar-Files: die Tabelle
+    wird automatisch erkannt (Pipe-Header + Separator-Zeile), Zeile wird
+    Format-erhaltend ans Ende der Tabelle angefuegt. Kein Prosa-Block,
+    kein Markdown-Drift.
+
+    Tabellen-Erkennung:
+      | A | B | C |   <- Header
+      |---|---|---|   <- Separator
+      | x | y | z |   <- Daten
+
+    Disambiguierung bei mehreren Tabellen: `heading` setzen (substring
+    eines H1/H2/H3 — Tabelle wird unter dieser Heading gesucht).
+
+    Trailing-empty-row als Spacer wird respektiert: wenn die letzte
+    Zeile ein leerer Spacer (`| | | |`) ist, wird DAVOR eingefuegt.
+
+    Args:
+        path: Rel-Pfad zur .md-Datei
+        values: Cell-Werte als list[str]. Anzahl MUSS exakt zu Tabellen-
+                Spalten passen (Schema-Strict). Pipes/Newlines werden
+                automatisch escaped.
+        heading: Optional. H1/H2/H3-Substring um Tabelle zu adressieren
+                 wenn mehrere im File sind.
+
+    Returns:
+        {path, columns, total_data_rows_after, snapshot}
+    """
+    if err := validators.validate_append_table_row(path, values, heading):
+        raise ToolError(err)
+
+    try:
+        post = vault.read_post(path)
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    body = post.content
+    lines = body.split("\n")
+
+    try:
+        header_idx, sep_idx, n_cols = _find_table(lines, heading)
+    except ValueError as e:
+        raise ToolError(str(e))
+
+    if len(values) != n_cols:
+        raise ToolError(
+            f"Spaltenzahl-Mismatch: Tabelle hat {n_cols} Spalten, "
+            f"values hat {len(values)}. Tabellen-Header: {lines[header_idx]!r}"
+        )
+
+    # Letzte Daten-Zeile in der Tabelle finden
+    last_data_idx = sep_idx
+    for j in range(sep_idx + 1, len(lines)):
+        if _is_table_row(lines[j]):
+            last_data_idx = j
+        else:
+            break
+
+    # Insert-Position: vor Spacer-Row (alle Cells leer) sonst danach
+    def _is_spacer_row(line: str) -> bool:
+        s = line.strip()
+        if not (s.startswith("|") and s.endswith("|")):
+            return False
+        cells = [c.strip() for c in s[1:-1].split("|")]
+        return all(c == "" for c in cells)
+
+    if last_data_idx > sep_idx and _is_spacer_row(lines[last_data_idx]):
+        insert_at = last_data_idx
+    else:
+        insert_at = last_data_idx + 1
+
+    new_row = "| " + " | ".join(_escape_cell(v) for v in values) + " |"
+
+    # Snapshot vor Write
+    before_bytes = vault.safe_path(path).read_bytes()
+    snapshot.snapshot_path(path, before_bytes, "append_table_row")
+
+    # Insert + write
+    lines.insert(insert_at, new_row)
+    post.content = "\n".join(lines)
+    vault.write_post(path, post)
+
+    # Anzahl Daten-Zeilen nach Insert (alle Tabellen-Rows nach Separator,
+    # ohne Spacer)
+    data_rows = 0
+    for j in range(sep_idx + 1, len(lines)):
+        if not _is_table_row(lines[j]):
+            break
+        if not _is_spacer_row(lines[j]):
+            data_rows += 1
+
+    return {
+        "path": path,
+        "columns": n_cols,
+        "total_data_rows_after": data_rows,
+        "inserted_at_line": insert_at,
+    }
+
+
 @mcp.tool()
 def task(
     id: str,
@@ -2668,6 +2895,7 @@ TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     # --- Edit (modifies existing) ---
     "edit_file":            {"title": "Datei editieren"},
     "edit_file_replace":    {"title": "Find/Replace im File"},
+    "append_table_row":     {"title": "Tabellen-Zeile anhaengen"},
     "task":                 {"title": "Task-Aktion (done/reopen/snooze/edit)"},
     "move":                 {"destructiveHint": True, "title": "Datei verschieben (mit Wikilink-Migration)"},
     "move_bulk":            {"destructiveHint": True, "title": "Bulk-Move mehrerer Files"},
