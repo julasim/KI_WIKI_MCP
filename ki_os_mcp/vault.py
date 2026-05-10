@@ -277,6 +277,89 @@ def collect_project_content(project_slug: str) -> dict[str, list[dict[str, str]]
     return sections
 
 
+# ---------- Wikilink-Targets / Inline-Tags / Headings ------------------------
+# Helper fuer die Query-Tools (backlinks/outgoing/tags/outline). Bewusst hier
+# damit ein Wikilink-Parser-Refactor nur an EINER Stelle passieren muss.
+
+
+def parse_wikilink_targets(text: str) -> list[str]:
+    """Liste aller `[[target]]` IDs aus einem Text (deduped, ohne anchor/display).
+
+    Skipt Wikilinks in fenced Code-Blocks (```...```) — die sind Beispiele,
+    keine echten Links. Inline-Code (`...`) bleibt ungefiltert (zu fragil).
+    """
+    cleaned = _strip_code_blocks(text)
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _WIKILINK_RE.finditer(cleaned):
+        target = m.group(1).strip()
+        if target and target not in seen:
+            seen.add(target)
+            out.append(target)
+    return out
+
+
+# Inline-Tags: `#tag` oder `#parent/child`. Nicht: `#1` (nur Ziffern),
+# nicht direkt nach Word-Char (z.B. `https://x.com/path#anchor`).
+_INLINE_TAG_RE = re.compile(r"(?<![A-Za-z0-9_/])#([A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß0-9_/\-]{1,})")
+
+
+def _strip_code_blocks(text: str) -> str:
+    """Entfernt fenced code blocks (```...```) — fuer Tag/Wikilink-Scan."""
+    return re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+
+
+def parse_inline_tags(text: str) -> set[str]:
+    """Set aller `#tag`-Inline-Tags im Body. Code-Blocks ausgeklammert."""
+    cleaned = _strip_code_blocks(text)
+    return {m.group(1) for m in _INLINE_TAG_RE.finditer(cleaned)}
+
+
+# Markdown-Heading: `# Title` bis `###### Title`. Nicht `#tag` (kein Space danach).
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+
+
+def extract_headings(text: str) -> list[dict[str, Any]]:
+    """Returns [{level, text, line}, ...] fuer Markdown-Headings.
+
+    Code-Blocks werden ausgeklammert (`#` darin sind kein Heading).
+    """
+    out: list[dict[str, Any]] = []
+    in_code = False
+    for i, line in enumerate(text.split("\n"), 1):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            out.append({
+                "level": len(m.group(1)),
+                "text": m.group(2).strip(),
+                "line": i,
+            })
+    return out
+
+
+def file_id(rel: str) -> str | None:
+    """Aufloesen path → id. Erst Frontmatter `id`, sonst filename ohne `.md`.
+
+    Wikilinks linken auf IDs, nicht auf Pfade — fuer get_backlinks brauchen
+    wir den Resolver path → id.
+    """
+    try:
+        post = read_post(rel)
+        fm_id = post.metadata.get("id")
+        if fm_id:
+            return str(fm_id).strip()
+    except (VaultError, OSError):
+        pass
+    stem = Path(rel).stem
+    return stem or None
+
+
 def find_related_refs(target_id: str) -> list[Path]:
     """Findet alle .md-Files die `target_id` in ihrer Frontmatter
     `related[]`-Liste haben (egal ob auch im Body verlinkt oder nicht).

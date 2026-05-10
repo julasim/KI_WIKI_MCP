@@ -245,6 +245,84 @@ def validate_create_project(name: str, parent: str | None) -> str | None:
     return None
 
 
+# ---------- Phase-X4 Query-Tools ---------------------------------------------
+# get_backlinks, get_outgoing_links, list_tags, find_by_tag, find_by_property,
+# resolve_alias, get_outline
+
+
+VALID_PROPERTY_OPS = {"eq", "contains", "gt", "lt", "exists", "in"}
+
+
+def validate_get_backlinks(path: str, scope: str | None) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    return None
+
+
+def validate_get_outgoing_links(path: str) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if not path.endswith(".md"):
+        return _err("path", "nur fuer .md-Files")
+    return None
+
+
+def validate_list_tags(scope: str | None, min_count: int) -> str | None:
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    if not isinstance(min_count, int) or min_count < 1:
+        return _err("min_count", "muss int >= 1 sein")
+    return None
+
+
+def validate_find_by_tag(tag: str, scope: str | None) -> str | None:
+    if e := _check_string_required(tag, "tag"): return e
+    # Normalisiere `#tag` → `tag` (User-Tippfehler abfangen)
+    if tag.startswith("#"):
+        tag = tag[1:]
+    if not re.fullmatch(r"[A-Za-zÄÖÜäöüß][A-Za-zÄÖÜäöüß0-9_/\-]{1,}", tag):
+        return _err("tag", f"ungueltiges Tag-Format: {tag!r}")
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    return None
+
+
+def validate_find_by_property(
+    field: str, value: Any, op: str, scope: str | None
+) -> str | None:
+    if e := _check_string_required(field, "field"): return e
+    if op not in VALID_PROPERTY_OPS:
+        return _err("op", f"erlaubt: {sorted(VALID_PROPERTY_OPS)}, bekommen: {op!r}")
+    if op == "exists":
+        if value is not None:
+            return _err("value", "fuer op='exists' muss value None sein")
+    elif op == "in":
+        if not isinstance(value, list) or not value:
+            return _err("value", "fuer op='in' muss value eine nicht-leere Liste sein")
+    else:
+        if value is None:
+            return _err("value", f"fuer op={op!r} ist value Pflicht")
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    return None
+
+
+def validate_resolve_alias(query: str, scope: str | None) -> str | None:
+    if e := _check_string_required(query, "query"): return e
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    return None
+
+
+def validate_get_outline(path: str, include_tables: bool) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if not path.endswith(".md"):
+        return _err("path", "nur fuer .md-Files")
+    if not isinstance(include_tables, bool):
+        return _err("include_tables", "muss bool sein")
+    return None
+
+
 def validate_append_table_row(
     path: str, values: list[str], heading: str | None
 ) -> str | None:

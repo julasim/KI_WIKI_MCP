@@ -2639,6 +2639,407 @@ def vault_autolink(dry_run: bool = False) -> dict[str, Any]:
         raise ToolError(str(e))
 
 
+# ---------- Phase-X4 Query-Tools --------------------------------------------
+# Read-only Lookup-Tools fuer Vault-Inhalts-Modell:
+# Backlinks, Outgoing-Links, Tags, Frontmatter-Properties, Aliases, Outline.
+# Alle haben readOnlyHint=True.
+
+
+@mcp.tool()
+def get_backlinks(path: str, scope: str | None = None) -> dict[str, Any]:
+    """Findet alle Files die auf `path` linken.
+
+    Erkennt:
+      - Wikilinks `[[<id>]]`, `[[<id>|display]]`, `[[<id>#anchor]]`
+      - Frontmatter `related: [<id>, ...]`
+
+    `path → id`-Resolution: Frontmatter `id`-Field zuerst, sonst filename
+    ohne `.md`. Wenn `path` selbst nicht existiert: trotzdem versuchen
+    (filename-fallback) — sinnvoll fuer Lookup nach geloeschten IDs.
+
+    Args:
+        path: Rel-Pfad zur Ziel-Datei (oder direkt eine ID-aehnliche Form)
+        scope: Optional auf Subfolder beschraenken (z.B. `05_Projects`)
+
+    Returns:
+        {target_id, total, hits: [{path, lines, via}]}
+        via ∈ {"wikilink", "related"}
+    """
+    if err := validators.validate_get_backlinks(path, scope):
+        raise ToolError(err)
+
+    target_id = vault.file_id(path) or path
+    target_id = target_id.strip()
+    if not target_id:
+        raise ToolError("Kann ID aus Pfad nicht ableiten")
+
+    hits: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    # Wikilink-Refs
+    for p, line_nums in vault.find_wikilink_refs(target_id):
+        rel = vault.rel_path(p)
+        if scope and not rel.startswith(scope.rstrip("/") + "/"):
+            continue
+        seen_paths.add(rel)
+        hits.append({"path": rel, "lines": line_nums, "via": "wikilink"})
+
+    # Related-Refs (Frontmatter)
+    for p in vault.find_related_refs(target_id):
+        rel = vault.rel_path(p)
+        if scope and not rel.startswith(scope.rstrip("/") + "/"):
+            continue
+        if rel in seen_paths:
+            # Gleiches File via wikilink AND related — als kombiniert markieren
+            for h in hits:
+                if h["path"] == rel:
+                    h["via"] = "wikilink+related"
+                    break
+        else:
+            hits.append({"path": rel, "lines": [], "via": "related"})
+
+    hits.sort(key=lambda h: h["path"])
+    return {"target_id": target_id, "total": len(hits), "hits": hits}
+
+
+@mcp.tool()
+def get_outgoing_links(path: str) -> dict[str, Any]:
+    """Listet alle Wikilinks im Body von `path`.
+
+    Aufgeloest:
+      - resolved_path: Pfad im Vault wenn ID gefunden wird
+      - resolved=False bei broken Links
+
+    Args:
+        path: Rel-Pfad zur Quell-Datei (.md)
+
+    Returns:
+        {path, total, links: [{target_id, resolved, resolved_path?}]}
+    """
+    if err := validators.validate_get_outgoing_links(path):
+        raise ToolError(err)
+    try:
+        post = vault.read_post(path)
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    targets = vault.parse_wikilink_targets(post.content)
+
+    # ID-Index aufbauen (id -> rel_path) fuer Aufloesung
+    id_index: dict[str, str] = {}
+    for p in vault.walk_md():
+        try:
+            tp = vault.read_post(vault.rel_path(p))
+        except (VaultError, OSError):
+            continue
+        fm_id = tp.metadata.get("id")
+        if fm_id:
+            id_index[str(fm_id).strip()] = vault.rel_path(p)
+        # Filename-fallback (low priority — nur wenn kein FM-id existiert)
+        stem = p.stem
+        if stem and stem not in id_index:
+            id_index[stem] = vault.rel_path(p)
+
+    links: list[dict[str, Any]] = []
+    for tid in targets:
+        resolved = tid in id_index
+        entry: dict[str, Any] = {"target_id": tid, "resolved": resolved}
+        if resolved:
+            entry["resolved_path"] = id_index[tid]
+        links.append(entry)
+
+    return {"path": path, "total": len(links), "links": links}
+
+
+@mcp.tool()
+def list_tags(scope: str | None = None, min_count: int = 1) -> dict[str, Any]:
+    """Tag-Index ueber den Vault. Counts pro Tag, sortiert.
+
+    Erfasst:
+      - Frontmatter `tags: [...]` (Liste oder String)
+      - Inline `#tag` im Body (Code-Blocks ausgeschlossen)
+
+    Args:
+        scope: Optional auf Subfolder beschraenken
+        min_count: Tags mit weniger Vorkommen werden ausgeblendet (default 1)
+
+    Returns:
+        {scope, total_unique, tags: [{tag, count, sources: {fm: int, inline: int}}]}
+    """
+    if err := validators.validate_list_tags(scope, min_count):
+        raise ToolError(err)
+
+    counts: dict[str, dict[str, int]] = {}
+    try:
+        files = vault.walk_md(scope or "")
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    for p in files:
+        try:
+            post = vault.read_post(vault.rel_path(p))
+        except (VaultError, OSError):
+            continue
+        # Frontmatter tags
+        fm_tags = post.metadata.get("tags") or []
+        if isinstance(fm_tags, str):
+            fm_tags = [fm_tags]
+        if isinstance(fm_tags, list):
+            for t in fm_tags:
+                if isinstance(t, str) and t.strip():
+                    name = t.strip().lstrip("#")
+                    counts.setdefault(name, {"fm": 0, "inline": 0})["fm"] += 1
+        # Inline tags
+        for t in vault.parse_inline_tags(post.content):
+            counts.setdefault(t, {"fm": 0, "inline": 0})["inline"] += 1
+
+    out = []
+    for name, src in counts.items():
+        total = src["fm"] + src["inline"]
+        if total < min_count:
+            continue
+        out.append({"tag": name, "count": total, "sources": src})
+    out.sort(key=lambda x: (-x["count"], x["tag"]))
+    return {"scope": scope or "", "total_unique": len(out), "tags": out}
+
+
+@mcp.tool()
+def find_by_tag(tag: str, scope: str | None = None) -> dict[str, Any]:
+    """Findet alle Files mit `tag` (Frontmatter ODER Inline).
+
+    Args:
+        tag: Tag-Name mit oder ohne `#`-Praefix (`#urgent` oder `urgent`)
+        scope: Optional auf Subfolder beschraenken
+
+    Returns:
+        {tag, total, hits: [{path, via}]}
+        via ∈ {"frontmatter", "inline", "frontmatter+inline"}
+    """
+    if err := validators.validate_find_by_tag(tag, scope):
+        raise ToolError(err)
+
+    needle = tag.lstrip("#").strip()
+    try:
+        files = vault.walk_md(scope or "")
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    hits: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            post = vault.read_post(vault.rel_path(p))
+        except (VaultError, OSError):
+            continue
+        fm_tags = post.metadata.get("tags") or []
+        if isinstance(fm_tags, str):
+            fm_tags = [fm_tags]
+        in_fm = isinstance(fm_tags, list) and any(
+            isinstance(t, str) and t.lstrip("#").strip() == needle for t in fm_tags
+        )
+        in_body = needle in vault.parse_inline_tags(post.content)
+        if not (in_fm or in_body):
+            continue
+        via = "frontmatter+inline" if (in_fm and in_body) else (
+            "frontmatter" if in_fm else "inline"
+        )
+        hits.append({"path": vault.rel_path(p), "via": via})
+
+    hits.sort(key=lambda h: h["path"])
+    return {"tag": needle, "total": len(hits), "hits": hits}
+
+
+@mcp.tool()
+def find_by_property(
+    field: str,
+    value: Any = None,
+    op: str = "eq",
+    scope: str | None = None,
+) -> dict[str, Any]:
+    """Sucht Files mit Frontmatter-Property `field` <op> `value`.
+
+    Operations:
+      - eq: field == value  (string-vergleich, case-sensitive)
+      - contains: value in field (string substring oder list-contains)
+      - gt / lt: numerisch oder ISO-Date-Vergleich
+      - exists: field ist im Frontmatter gesetzt (value=None)
+      - in: field-Wert ∈ value-Liste
+
+    Args:
+        field: Frontmatter-Feldname (z.B. "status", "priority", "due")
+        value: Vergleichswert (None bei op='exists')
+        op: Vergleichs-Operator (default 'eq')
+        scope: Optional Subfolder
+
+    Returns:
+        {field, op, value, total, hits: [{path, value: <gefundener Wert>}]}
+    """
+    if err := validators.validate_find_by_property(field, value, op, scope):
+        raise ToolError(err)
+    try:
+        files = vault.walk_md(scope or "")
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    def _match(actual: Any) -> bool:
+        if op == "exists":
+            return True  # nur erreichbar wenn field im FM
+        if op == "eq":
+            return str(actual) == str(value)
+        if op == "contains":
+            if isinstance(actual, list):
+                return any(str(value) in str(x) for x in actual)
+            return str(value) in str(actual)
+        if op == "in":
+            return str(actual) in {str(v) for v in value}
+        if op in ("gt", "lt"):
+            try:
+                a_num = float(actual)
+                v_num = float(value)
+                return (a_num > v_num) if op == "gt" else (a_num < v_num)
+            except (TypeError, ValueError):
+                # String-Vergleich (ISO-Dates lexikografisch korrekt)
+                return (str(actual) > str(value)) if op == "gt" else (str(actual) < str(value))
+        return False
+
+    hits: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            post = vault.read_post(vault.rel_path(p))
+        except (VaultError, OSError):
+            continue
+        if field not in post.metadata:
+            continue
+        actual = post.metadata[field]
+        if not _match(actual):
+            continue
+        # Komplexe Werte als String fuer Output (kein None/dict-Drift)
+        out_val = actual if isinstance(actual, (str, int, float, bool, list)) else str(actual)
+        hits.append({"path": vault.rel_path(p), "value": out_val})
+
+    hits.sort(key=lambda h: h["path"])
+    return {
+        "field": field, "op": op, "value": value,
+        "total": len(hits), "hits": hits,
+    }
+
+
+@mcp.tool()
+def resolve_alias(query: str, scope: str | None = None) -> dict[str, Any]:
+    """Sucht Files deren Frontmatter `aliases: [...]` `query` enthaelt.
+
+    Match-Logik (case-insensitive):
+      - exact: alias == query
+      - substring: query in alias
+
+    Returns Treffer sortiert: exact-matches zuerst.
+
+    Args:
+        query: Such-String (z.B. ein Spitzname, alternativer Name)
+        scope: Optional Subfolder
+
+    Returns:
+        {query, total, hits: [{path, alias_matched, match_type, id?, title?}]}
+        match_type ∈ {"exact", "substring"}
+    """
+    if err := validators.validate_resolve_alias(query, scope):
+        raise ToolError(err)
+    needle = query.strip().lower()
+    try:
+        files = vault.walk_md(scope or "")
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    hits: list[dict[str, Any]] = []
+    for p in files:
+        try:
+            post = vault.read_post(vault.rel_path(p))
+        except (VaultError, OSError):
+            continue
+        aliases = post.metadata.get("aliases")
+        if not isinstance(aliases, list):
+            continue
+        for a in aliases:
+            if not isinstance(a, str):
+                continue
+            a_low = a.strip().lower()
+            if not a_low:
+                continue
+            if a_low == needle:
+                match_type = "exact"
+            elif needle in a_low:
+                match_type = "substring"
+            else:
+                continue
+            hits.append({
+                "path": vault.rel_path(p),
+                "alias_matched": a,
+                "match_type": match_type,
+                "id": str(post.metadata.get("id", "")) or None,
+                "title": str(post.metadata.get("title", "")) or None,
+            })
+            break  # ein Hit pro File reicht
+
+    # Exact-matches zuerst, dann nach Path
+    hits.sort(key=lambda h: (0 if h["match_type"] == "exact" else 1, h["path"]))
+    return {"query": query, "total": len(hits), "hits": hits}
+
+
+@mcp.tool()
+def get_outline(path: str, include_tables: bool = False) -> dict[str, Any]:
+    """Strukturelles Outline einer Markdown-Datei.
+
+    Token-Saver bei grossen Files: LLM weiss welche Sections existieren,
+    ohne den ganzen Body zu lesen. Plus Tabellen-Header optional damit der
+    LLM `append_table_row` informiert aufrufen kann.
+
+    Args:
+        path: Rel-Pfad zur .md-Datei
+        include_tables: Wenn True, auch Tabellen-Header (mit Spalten) im Outline
+
+    Returns:
+        {path, headings: [{level, text, line}],
+         tables?: [{line, columns: [str], n_data_rows}]}
+    """
+    if err := validators.validate_get_outline(path, include_tables):
+        raise ToolError(err)
+    try:
+        post = vault.read_post(path)
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    body = post.content
+    result: dict[str, Any] = {
+        "path": path,
+        "headings": vault.extract_headings(body),
+    }
+
+    if include_tables:
+        # Tabellen finden via existierender Helper aus append_table_row-Block
+        lines = body.split("\n")
+        tables: list[dict[str, Any]] = []
+        i = 0
+        while i < len(lines) - 1:
+            if _is_table_row(lines[i]) and _is_table_separator(lines[i + 1]):
+                cols_raw = lines[i].strip()[1:-1].split("|")
+                cols = [c.strip() for c in cols_raw]
+                # Daten-Zeilen zaehlen
+                j = i + 2
+                n_data = 0
+                while j < len(lines) and _is_table_row(lines[j]):
+                    s = lines[j].strip()
+                    cells = [c.strip() for c in s[1:-1].split("|")]
+                    if not all(c == "" for c in cells):
+                        n_data += 1
+                    j += 1
+                tables.append({"line": i + 1, "columns": cols, "n_data_rows": n_data})
+                i = j
+            else:
+                i += 1
+        result["tables"] = tables
+
+    return result
+
+
 @mcp.tool()
 def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
     """Schreibt rohen Text in ein File (ohne Frontmatter, ohne Schema).
@@ -2883,6 +3284,14 @@ TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     "read_yesterday_daily": {"readOnlyHint": True, "title": "Gestrige Daily lesen"},
     "goal_status_check":    {"readOnlyHint": True, "title": "Goal-Status-Check"},
     "vault_lint":           {"readOnlyHint": True, "title": "Vault-Schema-Linter"},
+    # --- Phase-X4 Query-Tools (read-only Vault-Inhalts-Modell) ---
+    "get_backlinks":        {"readOnlyHint": True, "title": "Backlinks finden"},
+    "get_outgoing_links":   {"readOnlyHint": True, "title": "Ausgehende Links"},
+    "list_tags":            {"readOnlyHint": True, "title": "Tag-Index"},
+    "find_by_tag":          {"readOnlyHint": True, "title": "Files nach Tag finden"},
+    "find_by_property":     {"readOnlyHint": True, "title": "Files nach Frontmatter-Property"},
+    "resolve_alias":        {"readOnlyHint": True, "title": "Alias aufloesen"},
+    "get_outline":          {"readOnlyHint": True, "title": "Heading-Outline einer Datei"},
     # --- Write (creates new content, kein destructive Update) ---
     "create_note":          {"title": "Note anlegen"},
     "create_task":          {"title": "Task anlegen"},
