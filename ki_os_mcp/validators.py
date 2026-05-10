@@ -446,6 +446,71 @@ def validate_apply_template(
     return None
 
 
+# ---------- Phase-X6 Dashboard / Workflow-Smooth -----------------------------
+
+
+def validate_vault_stats(scope: str | None, top_n_recent: int) -> str | None:
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    if not isinstance(top_n_recent, int) or top_n_recent < 0 or top_n_recent > 100:
+        return _err("top_n_recent", "int 0..100")
+    return None
+
+
+def validate_get_subgraph(
+    start_path: str, depth: int, max_nodes: int, include_incoming: bool,
+) -> str | None:
+    if e := _check_string_required(start_path, "start_path"): return e
+    if not isinstance(depth, int) or depth < 1 or depth > 5:
+        return _err("depth", "int 1..5 (groesser fuehrt zu Token-Explosion)")
+    if not isinstance(max_nodes, int) or max_nodes < 1 or max_nodes > 200:
+        return _err("max_nodes", "int 1..200")
+    if not isinstance(include_incoming, bool):
+        return _err("include_incoming", "muss bool sein")
+    return None
+
+
+def validate_random_note(
+    scope: str | None, tag_filter: str | None, exclude_status: list[str] | None,
+) -> str | None:
+    if scope is not None and not isinstance(scope, str):
+        return _err("scope", "muss str oder None sein")
+    if tag_filter is not None:
+        if not isinstance(tag_filter, str) or not tag_filter.strip():
+            return _err("tag_filter", "wenn gesetzt: nicht-leerer String")
+    if exclude_status is not None:
+        if not isinstance(exclude_status, list):
+            return _err("exclude_status", "muss list[str] oder None sein")
+        for i, s in enumerate(exclude_status):
+            if not isinstance(s, str):
+                return _err(f"exclude_status[{i}]", "muss str sein")
+    return None
+
+
+def validate_file_audit(
+    path: str, since: str | None, limit: int,
+) -> str | None:
+    if e := _check_string_required(path, "path"): return e
+    if since is not None:
+        # Akzeptiert ISO-Datum (YYYY-MM-DD) oder ISO-Datetime (YYYY-MM-DDTHH:MM:SS)
+        if not isinstance(since, str):
+            return _err("since", "muss str sein")
+        if not (re.match(r"^\d{4}-\d{2}-\d{2}$", since)
+                or re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}", since)):
+            return _err("since", f"erwarte ISO-Datum oder ISO-Datetime: {since!r}")
+    if not isinstance(limit, int) or limit < 1 or limit > 500:
+        return _err("limit", "int 1..500")
+    return None
+
+
+def validate_project_overview(slug: str, recent_n: int) -> str | None:
+    if e := _check_string_required(slug, "slug"): return e
+    if e := _check_slug(slug): return e
+    if not isinstance(recent_n, int) or recent_n < 0 or recent_n > 50:
+        return _err("recent_n", "int 0..50")
+    return None
+
+
 def validate_append_table_row(
     path: str, values: list[str], heading: str | None
 ) -> str | None:

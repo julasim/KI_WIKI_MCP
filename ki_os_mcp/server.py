@@ -16,6 +16,7 @@ Run via Docker (siehe Dockerfile + docker-compose.yml im stack-repo).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -3517,6 +3518,537 @@ def apply_template(
     }
 
 
+# ---------- Phase-X6 Dashboard / Workflow-Smooth -----------------------------
+# 5 read-only Aggregat-/Explore-Tools.
+
+
+@mcp.tool()
+def vault_stats(
+    scope: str | None = None,
+    top_n_recent: int = 5,
+) -> dict[str, Any]:
+    """Aggregat-Statistiken ueber den Vault (oder Subfolder).
+
+    Args:
+        scope: Optional Subfolder ("" = ganzer Vault)
+        top_n_recent: Anzahl der zuletzt geaenderten Files (0 = aus)
+
+    Returns:
+        {scope, total_files, total_words, total_size_bytes,
+         tasks: {open, in_progress, blocked, done, snoozed, total},
+         by_type: {note: int, task: int, meeting: int, daily: int, ...},
+         by_status: {draft: int, ...},
+         recent_modifications: [{path, mtime, size}],
+         last_modified}
+    """
+    if err := validators.validate_vault_stats(scope, top_n_recent):
+        raise ToolError(err)
+    try:
+        files = vault.walk_md(scope or "")
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    total_words = 0
+    total_size = 0
+    by_type: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    task_counts: dict[str, int] = {
+        "open": 0, "in_progress": 0, "blocked": 0,
+        "done": 0, "snoozed": 0, "cancelled": 0,
+    }
+    file_meta: list[tuple[float, str, int]] = []  # (mtime, rel_path, size)
+    last_mtime = 0.0
+
+    for p in files:
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        total_size += stat.st_size
+        if stat.st_mtime > last_mtime:
+            last_mtime = stat.st_mtime
+        rel = vault.rel_path(p)
+        file_meta.append((stat.st_mtime, rel, stat.st_size))
+
+        try:
+            post = vault.read_post(rel)
+        except (VaultError, OSError):
+            continue
+        # Word count (rough — split on whitespace)
+        total_words += len(post.content.split())
+        ftype = str(post.metadata.get("type", "note"))
+        by_type[ftype] = by_type.get(ftype, 0) + 1
+        fstatus = post.metadata.get("status")
+        if fstatus:
+            s_str = str(fstatus)
+            by_status[s_str] = by_status.get(s_str, 0) + 1
+        # Task-Status zaehlen wenn type=task
+        if ftype == "task":
+            normalized = str(fstatus or "open").replace("-", "_")
+            if normalized in task_counts:
+                task_counts[normalized] += 1
+            else:
+                task_counts["open"] += 1
+
+    task_counts["total"] = sum(v for k, v in task_counts.items() if k != "total")
+
+    file_meta.sort(reverse=True)  # neueste zuerst
+    recent: list[dict[str, Any]] = []
+    if top_n_recent > 0:
+        for mtime, rel, size in file_meta[:top_n_recent]:
+            recent.append({
+                "path": rel,
+                "mtime": datetime.fromtimestamp(mtime).isoformat(timespec="seconds"),
+                "size": size,
+            })
+
+    last_iso = (
+        datetime.fromtimestamp(last_mtime).isoformat(timespec="seconds")
+        if last_mtime else None
+    )
+
+    return {
+        "scope": scope or "",
+        "total_files": len(files),
+        "total_words": total_words,
+        "total_size_bytes": total_size,
+        "tasks": task_counts,
+        "by_type": dict(sorted(by_type.items(), key=lambda x: -x[1])),
+        "by_status": dict(sorted(by_status.items(), key=lambda x: -x[1])),
+        "recent_modifications": recent,
+        "last_modified": last_iso,
+    }
+
+
+@mcp.tool()
+def get_subgraph(
+    start_path: str,
+    depth: int = 2,
+    max_nodes: int = 50,
+    include_incoming: bool = True,
+) -> dict[str, Any]:
+    """Verlinkungs-Cluster rund um ein Start-File (BFS).
+
+    Folgt Wikilinks (outgoing) und optional Backlinks (incoming) bis zur
+    angegebenen Distanz. Hilft bei "zeig mir alles im Umfeld dieser Note"-
+    Recherche.
+
+    Args:
+        start_path: Rel-Pfad zum Start-File
+        depth: Max-Distanz in Hops (1..5)
+        max_nodes: Hard-Cap fuer Knoten (default 50)
+        include_incoming: Auch Backlinks folgen (default True)
+
+    Returns:
+        {start, total_nodes, total_edges,
+         nodes: [{path, id, distance}],
+         edges: [{from, to, type: 'outgoing'|'incoming'}],
+         truncated: bool}
+    """
+    if err := validators.validate_get_subgraph(
+        start_path, depth, max_nodes, include_incoming
+    ):
+        raise ToolError(err)
+
+    # ID-Index aufbauen (id -> rel_path) fuer outgoing-Resolution
+    id_index: dict[str, str] = {}
+    for p in vault.walk_md():
+        try:
+            tp = vault.read_post(vault.rel_path(p))
+        except (VaultError, OSError):
+            continue
+        fm_id = tp.metadata.get("id")
+        if fm_id:
+            id_index[str(fm_id).strip()] = vault.rel_path(p)
+        stem = p.stem
+        if stem and stem not in id_index:
+            id_index[stem] = vault.rel_path(p)
+
+    start_id = vault.file_id(start_path) or Path(start_path).stem
+
+    # BFS
+    visited: dict[str, int] = {start_path: 0}  # path -> distance
+    edges: list[dict[str, str]] = []
+    queue: list[tuple[str, int]] = [(start_path, 0)]
+    truncated = False
+
+    while queue and len(visited) < max_nodes:
+        current, dist = queue.pop(0)
+        if dist >= depth:
+            continue
+        # Outgoing: parse Wikilinks im body
+        try:
+            post = vault.read_post(current)
+        except (VaultError, OSError):
+            continue
+        for tid in vault.parse_wikilink_targets(post.content):
+            if tid in id_index:
+                neigh = id_index[tid]
+                edges.append({"from": current, "to": neigh, "type": "outgoing"})
+                if neigh not in visited:
+                    if len(visited) >= max_nodes:
+                        truncated = True
+                        break
+                    visited[neigh] = dist + 1
+                    queue.append((neigh, dist + 1))
+
+        if truncated:
+            break
+
+        # Incoming: find_wikilink_refs(current_id)
+        if include_incoming:
+            current_id = vault.file_id(current) or Path(current).stem
+            for p, _lines in vault.find_wikilink_refs(current_id):
+                neigh = vault.rel_path(p)
+                edges.append({"from": neigh, "to": current, "type": "incoming"})
+                if neigh not in visited:
+                    if len(visited) >= max_nodes:
+                        truncated = True
+                        break
+                    visited[neigh] = dist + 1
+                    queue.append((neigh, dist + 1))
+
+    nodes_out = [
+        {
+            "path": p,
+            "id": vault.file_id(p) or Path(p).stem,
+            "distance": d,
+        }
+        for p, d in sorted(visited.items(), key=lambda x: (x[1], x[0]))
+    ]
+    # Edges deduplizieren (gleicher from→to gleicher type)
+    seen_edges: set[tuple[str, str, str]] = set()
+    deduped_edges: list[dict[str, str]] = []
+    for e in edges:
+        key = (e["from"], e["to"], e["type"])
+        if key not in seen_edges:
+            seen_edges.add(key)
+            deduped_edges.append(e)
+
+    return {
+        "start": start_path,
+        "start_id": start_id,
+        "total_nodes": len(nodes_out),
+        "total_edges": len(deduped_edges),
+        "nodes": nodes_out,
+        "edges": deduped_edges,
+        "truncated": truncated,
+    }
+
+
+@mcp.tool()
+def random_note(
+    scope: str | None = None,
+    tag_filter: str | None = None,
+    exclude_status: list[str] | None = None,
+) -> dict[str, Any]:
+    """Liefert eine zufaellige Note aus dem Vault.
+
+    Use-Cases: Spaced-Repetition, kreativer Anstoss, "zeig mir was Altes
+    auf das ich vergessen habe".
+
+    Args:
+        scope: Optional Subfolder (z.B. "10_Life/notes")
+        tag_filter: Nur Files mit diesem Tag (FM oder inline, mit/ohne #)
+        exclude_status: Status-Liste die ausgeschlossen wird (z.B. ["done", "deprecated"])
+
+    Returns:
+        {path, id, title, tags, status, body_preview, total_candidates}
+        oder {error: "no candidates", total_candidates: 0} wenn nichts passt
+    """
+    if err := validators.validate_random_note(scope, tag_filter, exclude_status):
+        raise ToolError(err)
+
+    import random as _random
+
+    needle = tag_filter.lstrip("#").strip().lower() if tag_filter else None
+    skip_status = set(s.lower() for s in (exclude_status or []))
+
+    try:
+        files = vault.walk_md(scope or "")
+    except VaultError as e:
+        raise ToolError(str(e))
+
+    candidates: list[tuple[str, dict[str, Any], str]] = []  # (rel, meta, body)
+    for p in files:
+        rel = vault.rel_path(p)
+        try:
+            post = vault.read_post(rel)
+        except (VaultError, OSError):
+            continue
+        meta = post.metadata
+        if skip_status:
+            s = str(meta.get("status", "")).lower()
+            if s in skip_status:
+                continue
+        if needle:
+            fm_tags = meta.get("tags") or []
+            if isinstance(fm_tags, str):
+                fm_tags = [fm_tags]
+            in_fm = isinstance(fm_tags, list) and any(
+                isinstance(t, str) and t.lstrip("#").strip().lower() == needle
+                for t in fm_tags
+            )
+            in_body = needle in {t.lower() for t in vault.parse_inline_tags(post.content)}
+            if not (in_fm or in_body):
+                continue
+        candidates.append((rel, dict(meta), post.content))
+
+    if not candidates:
+        return {
+            "error": "no candidates",
+            "total_candidates": 0,
+            "scope": scope or "",
+            "tag_filter": tag_filter,
+            "exclude_status": exclude_status,
+        }
+
+    rel, meta, body = _random.choice(candidates)
+    preview = body.strip()[:300] + ("..." if len(body) > 300 else "")
+    return {
+        "path": rel,
+        "id": str(meta.get("id", Path(rel).stem)),
+        "title": str(meta.get("title", "")),
+        "tags": meta.get("tags", []),
+        "status": meta.get("status"),
+        "body_preview": preview,
+        "total_candidates": len(candidates),
+    }
+
+
+@mcp.tool()
+def file_audit(
+    path: str,
+    since: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Audit-Log-Eintraege fuer ein bestimmtes File.
+
+    Liefert die letzten Tool-Calls die `path` als Argument hatten —
+    Diagnose-Tool fuer "wer hat heute an Datei X was gemacht".
+
+    Args:
+        path: Rel-Pfad (matcht args.path / args.rel_path / args.target etc.)
+        since: ISO-Datum (YYYY-MM-DD) oder ISO-Datetime — nur Events seitdem
+        limit: Max-Anzahl (default 50)
+
+    Returns:
+        {path, since, total, events: [{ts, tool, args_summary, error?, latency_ms?}]}
+    """
+    if err := validators.validate_file_audit(path, since, limit):
+        raise ToolError(err)
+
+    log_path = audit.AUDIT_LOG_PATH
+    if not log_path.is_file():
+        return {"path": path, "since": since, "total": 0, "events": [],
+                "log_missing": True}
+
+    target = path.lstrip("/")
+
+    # since-Cutoff: erweitern auf full-day wenn nur Datum
+    cutoff = since
+    if cutoff and len(cutoff) == 10:
+        cutoff = cutoff + "T00:00:00"
+
+    events: list[dict[str, Any]] = []
+    # Append-only-Log: einfach zeilenweise lesen
+    try:
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except (ValueError, json.JSONDecodeError):
+                    continue
+                if ev.get("kind") != "tool_call":
+                    continue
+                args_d = ev.get("args") or {}
+                if not isinstance(args_d, dict):
+                    continue
+                # Match: irgendein args-Wert == target
+                hit = False
+                for k, v in args_d.items():
+                    if isinstance(v, str) and v.lstrip("/") == target:
+                        hit = True
+                        break
+                    if isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, str) and item.lstrip("/") == target:
+                                hit = True
+                                break
+                if not hit:
+                    continue
+                if cutoff and ev.get("ts", "") < cutoff:
+                    continue
+                # Args-Summary: kurze Form, keine Body/Content-Floods
+                args_summary = {
+                    k: (v if not (isinstance(v, str) and len(v) > 80)
+                        else v[:80] + "...")
+                    for k, v in args_d.items()
+                }
+                events.append({
+                    "ts": ev.get("ts"),
+                    "tool": ev.get("tool"),
+                    "args_summary": args_summary,
+                    "error": ev.get("error", False),
+                    "latency_ms": ev.get("latency_ms"),
+                })
+    except OSError as e:
+        raise ToolError(f"Audit-Log nicht lesbar: {e}")
+
+    # Neueste zuerst, dann limit
+    events.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    events = events[:limit]
+
+    return {
+        "path": path,
+        "since": since,
+        "total": len(events),
+        "events": events,
+    }
+
+
+@mcp.tool()
+def project_overview(
+    slug: str,
+    recent_n: int = 5,
+) -> dict[str, Any]:
+    """Eine-Call Aggregat fuer ein Projekt.
+
+    Statt 4-5 separate Tool-Calls (read_project_context, list_tasks,
+    walk notes/, walk meetings/, sum stunden): alles in einem.
+
+    Args:
+        slug: Projekt-Slug (Folder-Name unter 05_Projects/)
+        recent_n: Anzahl recent Notes/Meetings (0 = aus)
+
+    Returns:
+        {slug, exists, project_dir, status?, context_preview?,
+         counts: {notes, meetings, top_level, tasks_open, tasks_done},
+         hours_total?,
+         recent_notes: [...], recent_meetings: [...], top_level_files: [...],
+         tasks_open_top: [...]}
+    """
+    if err := validators.validate_project_overview(slug, recent_n):
+        raise ToolError(err)
+
+    project_dir = vault.VAULT_PATH / "05_Projects" / slug
+    if not project_dir.is_dir():
+        return {"slug": slug, "exists": False}
+
+    out: dict[str, Any] = {
+        "slug": slug,
+        "exists": True,
+        "project_dir": f"05_Projects/{slug}",
+    }
+
+    # README.md → status
+    readme = project_dir / "README.md"
+    if readme.is_file():
+        try:
+            post = vault.read_post(f"05_Projects/{slug}/README.md")
+            out["status"] = post.metadata.get("status")
+            out["title"] = post.metadata.get("title", slug)
+        except VaultError:
+            pass
+
+    # CONTEXT.md → preview
+    context = project_dir / "CONTEXT.md"
+    if context.is_file():
+        try:
+            txt = vault.read_text(f"05_Projects/{slug}/CONTEXT.md")
+            preview = txt.split("---", 2)[-1].strip()[:500]
+            out["context_preview"] = preview + ("..." if len(txt) > 500 else "")
+        except VaultError:
+            pass
+
+    # Notes + Meetings + Top-Level (via existing helper)
+    sections = vault.collect_project_content(slug)
+    notes = sections.get("Notes", [])
+    meetings = sections.get("Meetings", [])
+    sonstige = sections.get("Sonstige", [])
+
+    # Sortiert nach date desc
+    def _sort_by_date(items: list[dict[str, str]]) -> list[dict[str, str]]:
+        return sorted(items, key=lambda x: x.get("date", ""), reverse=True)
+
+    # Tasks: unter 10_Life/tasks/ mit project=slug filtern
+    tasks_dir = vault.VAULT_PATH / "10_Life" / "tasks"
+    tasks_open: list[dict[str, str]] = []
+    tasks_done = 0
+    if tasks_dir.is_dir():
+        for tp in tasks_dir.glob("*.md"):
+            try:
+                post = vault.read_post(vault.rel_path(tp))
+            except (VaultError, OSError):
+                continue
+            if str(post.metadata.get("project", "")) != slug:
+                continue
+            status = str(post.metadata.get("status", "open"))
+            if status == "done":
+                tasks_done += 1
+            else:
+                tasks_open.append({
+                    "id": str(post.metadata.get("id", tp.stem)),
+                    "title": str(post.metadata.get("title", tp.stem)),
+                    "due": str(post.metadata.get("due", "")) or None,
+                    "priority": str(post.metadata.get("priority", "")) or None,
+                    "status": status,
+                })
+
+    # Stunden-Summe wenn stundenaufzeichnung.md existiert
+    hours_total: float | None = None
+    stunden_file = project_dir / "stundenaufzeichnung.md"
+    if stunden_file.is_file():
+        try:
+            txt = vault.read_text(f"05_Projects/{slug}/stundenaufzeichnung.md")
+            # Suche Werte in Tabelle (Spalte mit Zahl im Format X,Y oder X.Y)
+            total = 0.0
+            for line in txt.split("\n"):
+                if not line.strip().startswith("|"):
+                    continue
+                cells = [c.strip() for c in line.strip()[1:-1].split("|")]
+                for c in cells:
+                    # Numerisch parsen wenn moeglich
+                    c_norm = c.replace(",", ".")
+                    try:
+                        v = float(c_norm)
+                        # Heuristik: typische Stundenwerte 0.1..24
+                        if 0.05 <= v <= 24:
+                            total += v
+                            break
+                    except ValueError:
+                        continue
+            hours_total = round(total, 2)
+        except VaultError:
+            pass
+
+    out["counts"] = {
+        "notes": len(notes),
+        "meetings": len(meetings),
+        "top_level": len(sonstige),
+        "tasks_open": len(tasks_open),
+        "tasks_done": tasks_done,
+    }
+    if hours_total is not None:
+        out["hours_total"] = hours_total
+    if recent_n > 0:
+        out["recent_notes"] = _sort_by_date(notes)[:recent_n]
+        out["recent_meetings"] = _sort_by_date(meetings)[:recent_n]
+        out["top_level_files"] = _sort_by_date(sonstige)[:recent_n]
+    # Top-Tasks (urgent/overdue zuerst)
+    priority_order = {"urgent": 0, "high": 1, "medium": 2, "low": 3}
+    tasks_open.sort(key=lambda t: (
+        priority_order.get(t.get("priority") or "medium", 2),
+        t.get("due") or "9999-99-99",
+    ))
+    out["tasks_open_top"] = tasks_open[:5]
+
+    return out
+
+
 @mcp.tool()
 def raw_write(path: str, content: str, overwrite: bool = False) -> dict[str, Any]:
     """Schreibt rohen Text in ein File (ohne Frontmatter, ohne Schema).
@@ -3810,6 +4342,12 @@ TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     "split_file":                 {"destructiveHint": True, "openWorldHint": False, "title": "Datei an Heading splitten"},
     "merge_files":                {"destructiveHint": True, "openWorldHint": False, "title": "Dateien zusammenfuehren"},
     "apply_template":             {"destructiveHint": False, "openWorldHint": False, "title": "Template anwenden"},
+    # --- Phase-X6: Dashboard / Workflow-Smooth (read-only Aggregate) ---
+    "vault_stats":                {"readOnlyHint": True, "openWorldHint": False, "title": "Vault-Statistik"},
+    "get_subgraph":               {"readOnlyHint": True, "openWorldHint": False, "title": "Linkgraph-Cluster"},
+    "random_note":                {"readOnlyHint": True, "openWorldHint": False, "title": "Zufaellige Note"},
+    "file_audit":                 {"readOnlyHint": True, "openWorldHint": False, "title": "File-Audit-Log"},
+    "project_overview":           {"readOnlyHint": True, "openWorldHint": False, "title": "Projekt-Uebersicht"},
 }
 
 
