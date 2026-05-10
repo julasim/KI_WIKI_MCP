@@ -3264,61 +3264,68 @@ def _wrap_tools_with_audit() -> None:
 # Sie sind UI-Hilfe, kein Sicherheitsmechanismus. Echter Schutz: Bearer-Auth +
 # strikte Server-side-Validation (haben wir).
 
+# Hint zu openWorldHint:
+# Default in der MCP-Spec ist `true` (= "Tool redet mit externer Welt"). Da
+# alle 47 Tools hier ausschliesslich auf dem lokalen Vault arbeiten — kein
+# Web, keine externen APIs — setzen wir das ueberall explizit auf `false`.
+# Das hilft MCP-Clients bei Cache-Heuristiken und Confirmation-Dialogen.
+
 TOOL_ANNOTATIONS: dict[str, dict[str, Any]] = {
     # --- Read-only ---
-    "search_vault":         {"readOnlyHint": True, "title": "Vault-Volltextsuche"},
-    "read_file":            {"readOnlyHint": True, "title": "Datei lesen"},
-    "list_files":           {"readOnlyHint": True, "title": "Folder-Inhalt listen"},
-    "list_tasks":           {"readOnlyHint": True, "title": "Tasks listen"},
-    "daily_briefing":       {"readOnlyHint": True, "title": "Tagesbriefing"},
-    "self_test":            {"readOnlyHint": True, "title": "Server-Self-Test"},
-    "read_vision":          {"readOnlyHint": True, "title": "5y-Vision lesen"},
-    "read_saeulen":         {"readOnlyHint": True, "title": "Saeulen-Tabelle lesen"},
-    "read_drift":           {"readOnlyHint": True, "title": "Drift-Anker lesen"},
-    "read_habits":          {"readOnlyHint": True, "title": "Habits lesen"},
-    "read_sport":           {"readOnlyHint": True, "title": "Sport-Sessions lesen"},
-    "read_books":           {"readOnlyHint": True, "title": "Buecher lesen"},
-    "read_wins":            {"readOnlyHint": True, "title": "Wins lesen"},
-    "compute_streak":       {"readOnlyHint": True, "title": "Habit-Streak berechnen"},
-    "read_reminders":       {"readOnlyHint": True, "title": "Reminders lesen"},
-    "read_yesterday_daily": {"readOnlyHint": True, "title": "Gestrige Daily lesen"},
-    "goal_status_check":    {"readOnlyHint": True, "title": "Goal-Status-Check"},
-    "vault_lint":           {"readOnlyHint": True, "title": "Vault-Schema-Linter"},
+    "search_vault":         {"readOnlyHint": True, "openWorldHint": False, "title": "Vault-Volltextsuche"},
+    "read_file":            {"readOnlyHint": True, "openWorldHint": False, "title": "Datei lesen"},
+    "list_files":           {"readOnlyHint": True, "openWorldHint": False, "title": "Folder-Inhalt listen"},
+    "list_tasks":           {"readOnlyHint": True, "openWorldHint": False, "title": "Tasks listen"},
+    "daily_briefing":       {"readOnlyHint": True, "openWorldHint": False, "title": "Tagesbriefing"},
+    "self_test":            {"readOnlyHint": True, "openWorldHint": False, "title": "Server-Self-Test"},
+    "read_vision":          {"readOnlyHint": True, "openWorldHint": False, "title": "5y-Vision lesen"},
+    "read_saeulen":         {"readOnlyHint": True, "openWorldHint": False, "title": "Saeulen-Tabelle lesen"},
+    "read_drift":           {"readOnlyHint": True, "openWorldHint": False, "title": "Drift-Anker lesen"},
+    "read_habits":          {"readOnlyHint": True, "openWorldHint": False, "title": "Habits lesen"},
+    "read_sport":           {"readOnlyHint": True, "openWorldHint": False, "title": "Sport-Sessions lesen"},
+    "read_books":           {"readOnlyHint": True, "openWorldHint": False, "title": "Buecher lesen"},
+    "read_wins":            {"readOnlyHint": True, "openWorldHint": False, "title": "Wins lesen"},
+    "compute_streak":       {"readOnlyHint": True, "openWorldHint": False, "title": "Habit-Streak berechnen"},
+    "read_reminders":       {"readOnlyHint": True, "openWorldHint": False, "title": "Reminders lesen"},
+    "read_yesterday_daily": {"readOnlyHint": True, "openWorldHint": False, "title": "Gestrige Daily lesen"},
+    "goal_status_check":    {"readOnlyHint": True, "openWorldHint": False, "title": "Goal-Status-Check"},
+    "vault_lint":           {"readOnlyHint": True, "openWorldHint": False, "title": "Vault-Schema-Linter"},
     # --- Phase-X4 Query-Tools (read-only Vault-Inhalts-Modell) ---
-    "get_backlinks":        {"readOnlyHint": True, "title": "Backlinks finden"},
-    "get_outgoing_links":   {"readOnlyHint": True, "title": "Ausgehende Links"},
-    "list_tags":            {"readOnlyHint": True, "title": "Tag-Index"},
-    "find_by_tag":          {"readOnlyHint": True, "title": "Files nach Tag finden"},
-    "find_by_property":     {"readOnlyHint": True, "title": "Files nach Frontmatter-Property"},
-    "resolve_alias":        {"readOnlyHint": True, "title": "Alias aufloesen"},
-    "get_outline":          {"readOnlyHint": True, "title": "Heading-Outline einer Datei"},
-    # --- Write (creates new content, kein destructive Update) ---
-    "create_note":          {"title": "Note anlegen"},
-    "create_task":          {"title": "Task anlegen"},
-    "create_meeting":       {"title": "Meeting anlegen"},
-    "create_project":       {"title": "Projekt-Container anlegen"},
-    "append_to_daily":      {"title": "An Daily-Note anhaengen"},
-    "goal_log":             {"title": "Goal-Log Eintrag"},
-    "project_context":      {"title": "Projekt-Kontext setzen"},
-    "raw_write":            {"destructiveHint": True, "title": "Raw File-Write (kann ueberschreiben)"},
-    # --- Edit (modifies existing) ---
-    "edit_file":            {"title": "Datei editieren"},
-    "edit_file_replace":    {"title": "Find/Replace im File"},
-    "append_table_row":     {"title": "Tabellen-Zeile anhaengen"},
-    "task":                 {"title": "Task-Aktion (done/reopen/snooze/edit)"},
-    "move":                 {"destructiveHint": True, "title": "Datei verschieben (mit Wikilink-Migration)"},
-    "move_bulk":            {"destructiveHint": True, "title": "Bulk-Move mehrerer Files"},
-    "move_project":         {"destructiveHint": True, "title": "Projekt-Folder verschieben/nesten"},
+    "get_backlinks":        {"readOnlyHint": True, "openWorldHint": False, "title": "Backlinks finden"},
+    "get_outgoing_links":   {"readOnlyHint": True, "openWorldHint": False, "title": "Ausgehende Links"},
+    "list_tags":            {"readOnlyHint": True, "openWorldHint": False, "title": "Tag-Index"},
+    "find_by_tag":          {"readOnlyHint": True, "openWorldHint": False, "title": "Files nach Tag finden"},
+    "find_by_property":     {"readOnlyHint": True, "openWorldHint": False, "title": "Files nach Frontmatter-Property"},
+    "resolve_alias":        {"readOnlyHint": True, "openWorldHint": False, "title": "Alias aufloesen"},
+    "get_outline":          {"readOnlyHint": True, "openWorldHint": False, "title": "Heading-Outline einer Datei"},
+    # --- Write (creates new content, append-only — explizit nicht-destruktiv,
+    # weil Spec-Default fuer !readOnly destructiveHint=true ist) ---
+    "create_note":          {"destructiveHint": False, "openWorldHint": False, "title": "Note anlegen"},
+    "create_task":          {"destructiveHint": False, "openWorldHint": False, "title": "Task anlegen"},
+    "create_meeting":       {"destructiveHint": False, "openWorldHint": False, "title": "Meeting anlegen"},
+    "create_project":       {"destructiveHint": False, "openWorldHint": False, "title": "Projekt-Container anlegen"},
+    "append_to_daily":      {"destructiveHint": False, "openWorldHint": False, "title": "An Daily-Note anhaengen"},
+    "goal_log":             {"destructiveHint": False, "openWorldHint": False, "title": "Goal-Log Eintrag"},
+    "project_context":      {"destructiveHint": False, "openWorldHint": False, "title": "Projekt-Kontext setzen"},
+    "raw_write":            {"destructiveHint": True, "openWorldHint": False, "title": "Raw File-Write (kann ueberschreiben)"},
+    # --- Edit (modifies existing — destructiveHint default true, hier explizit) ---
+    "edit_file":            {"destructiveHint": True, "openWorldHint": False, "title": "Datei editieren"},
+    "edit_file_replace":    {"destructiveHint": True, "openWorldHint": False, "title": "Find/Replace im File"},
+    "append_table_row":     {"destructiveHint": False, "openWorldHint": False, "title": "Tabellen-Zeile anhaengen"},
+    "task":                 {"destructiveHint": False, "openWorldHint": False, "title": "Task-Aktion (done/reopen/snooze/edit)"},
+    "move":                 {"destructiveHint": True, "openWorldHint": False, "title": "Datei verschieben (mit Wikilink-Migration)"},
+    "move_bulk":            {"destructiveHint": True, "openWorldHint": False, "title": "Bulk-Move mehrerer Files"},
+    "move_project":         {"destructiveHint": True, "openWorldHint": False, "title": "Projekt-Folder verschieben/nesten"},
     # --- Read project meta ---
-    "read_project_context": {"readOnlyHint": True, "title": "Projekt-CONTEXT.md lesen"},
+    "read_project_context": {"readOnlyHint": True, "openWorldHint": False, "title": "Projekt-CONTEXT.md lesen"},
     # --- Delete (2-step pattern) ---
-    "request_delete":       {"destructiveHint": True, "title": "Loesch-Anfrage (Stufe 1)"},
-    "confirm_delete":       {"destructiveHint": True, "title": "Loeschen bestaetigen (Stufe 2)"},
+    "request_delete":       {"destructiveHint": True, "openWorldHint": False, "title": "Loesch-Anfrage (Stufe 1)"},
+    "confirm_delete":       {"destructiveHint": True, "openWorldHint": False, "title": "Loeschen bestaetigen (Stufe 2)"},
     # --- Maintain (idempotent — wiederholbar ohne Drift) ---
-    "vault_autolink":          {"idempotentHint": True, "title": "Auto-Linking refresh"},
-    "vault_maintain":          {"idempotentHint": True, "title": "Self-Maintenance Pipeline"},
-    "task_reactivate_recurring": {"idempotentHint": True, "title": "Recurring-Tasks reaktivieren"},
-    "create_daily_skeleton":   {"idempotentHint": True, "title": "Daily-Skeleton vorbereiten"},
+    "vault_autolink":             {"idempotentHint": True, "openWorldHint": False, "title": "Auto-Linking refresh"},
+    "vault_maintain":             {"idempotentHint": True, "openWorldHint": False, "title": "Self-Maintenance Pipeline"},
+    "task_reactivate_recurring":  {"idempotentHint": True, "openWorldHint": False, "title": "Recurring-Tasks reaktivieren"},
+    "create_daily_skeleton":      {"idempotentHint": True, "openWorldHint": False, "title": "Daily-Skeleton vorbereiten"},
 }
 
 
