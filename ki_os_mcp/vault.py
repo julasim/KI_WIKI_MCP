@@ -131,7 +131,9 @@ def find_task(task_id_or_slug: str) -> Path | None:
 
 # [[id]], [[id|display]], [[id#anchor]], [[id#anchor|display]]
 # Capture: 1=id, 2=anchor (mit #), 3=display (mit |)
-_WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(\|[^\]]*)?\]\]")
+WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(#[^\]|]*)?(\|[^\]]*)?\]\]")
+# Backward-Compat-Alias (private Name war frueher exportiert)
+_WIKILINK_RE = WIKILINK_RE
 
 
 def find_wikilink_refs(target_id: str) -> list[tuple[Path, list[int]]]:
@@ -316,7 +318,24 @@ def parse_inline_tags(text: str) -> set[str]:
 
 
 # Markdown-Heading: `# Title` bis `###### Title`. Nicht `#tag` (kein Space danach).
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+# Backward-Compat-Alias (private Name war frueher exportiert)
+_HEADING_RE = HEADING_RE
+
+
+def heading_level(line: str) -> int:
+    """Returnt 1-6 fuer `# Title` bis `###### Title`, sonst 0.
+
+    `#word` (kein Space) ist kein Heading. `#tag` matcht damit nicht.
+    """
+    m = HEADING_RE.match(line)
+    return len(m.group(1)) if m else 0
+
+
+def heading_text(line: str) -> str:
+    """Extrahiert den Heading-Text ohne `#`-Praefix. Leerstring bei Nicht-Heading."""
+    m = HEADING_RE.match(line)
+    return m.group(2).strip() if m else ""
 
 
 def extract_headings(text: str) -> list[dict[str, Any]]:
@@ -333,7 +352,7 @@ def extract_headings(text: str) -> list[dict[str, Any]]:
             continue
         if in_code:
             continue
-        m = _HEADING_RE.match(line)
+        m = HEADING_RE.match(line)
         if m:
             out.append({
                 "level": len(m.group(1)),
@@ -371,7 +390,7 @@ def find_heading_range(lines: list[str], heading: str) -> tuple[int, int] | None
             continue
         if in_code:
             continue
-        m = _HEADING_RE.match(line)
+        m = HEADING_RE.match(line)
         if m and target in m.group(2).strip().lower():
             h_idx = i
             h_level = len(m.group(1))
@@ -389,7 +408,7 @@ def find_heading_range(lines: list[str], heading: str) -> tuple[int, int] | None
             continue
         if in_code:
             continue
-        m = _HEADING_RE.match(lines[j])
+        m = HEADING_RE.match(lines[j])
         if m and len(m.group(1)) <= h_level:
             end_idx = j
             break

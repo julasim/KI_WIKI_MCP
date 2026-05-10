@@ -88,8 +88,28 @@ def snapshot_paths(paths_with_content: list[tuple[str, bytes]], op: str) -> str 
 
 
 # snapshot_id Format: `<YYYY-MM-DD>/<HH-MM-SS>_<op>_<slug>.tar.gz`
+#
+# WICHTIG: op ist als CLOSED SET implementiert. Der naive Regex
+# `([a-z_]+)_([a-z0-9\-]+)` matcht greedy, sodass `edit_replace_my-slug`
+# als op=edit_replace_my, slug=slug interpretiert wird (off-by-1). Die
+# Liste hier muss bei jedem neuen `snapshot(...)` / `snapshot_path(...)`
+# Aufruf mit-aktualisiert werden — sonst werden neue Snapshots vom
+# regex nicht gematcht und in list_snapshots ignoriert.
+SNAPSHOT_OPS = (
+    "edit",
+    "edit_replace",
+    "append_table_row",
+    "append_under_heading",
+    "apply_template",
+    "delete",
+    "move",
+    "merge",
+    "split_source",
+    "raw_write",
+    "pre_restore",
+)
 _SNAPSHOT_NAME_RE = re.compile(
-    r"^(\d{2}-\d{2}-\d{2})_([a-z_]+)_([a-z0-9\-]+)\.tar\.gz$"
+    r"^(\d{2}-\d{2}-\d{2})_(" + "|".join(SNAPSHOT_OPS) + r")_([a-z0-9\-]+)\.tar\.gz$"
 )
 
 

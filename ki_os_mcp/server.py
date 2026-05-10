@@ -661,31 +661,26 @@ def _is_table_row(line: str) -> bool:
     return s.startswith("|") and s.endswith("|") and not _is_table_separator(line)
 
 
-def _heading_level(line: str) -> int:
-    """Returnt 1-6 fuer #..######, sonst 0."""
-    s = line.lstrip()
-    if not s.startswith("#"):
-        return 0
-    n = 0
-    for ch in s:
-        if ch == "#":
-            n += 1
-        else:
-            break
-    if n > 6 or n == 0:
-        return 0
-    if len(s) > n and s[n] != " ":
-        return 0  # `#word` ist kein Heading
-    return n
+def _split_header_cells(header_line: str) -> list[str]:
+    """Splittet eine Tabellen-Header-Zeile in cells, ohne leere Edge-Cells.
 
-
-def _heading_text(line: str) -> str:
-    """Extrahiert Heading-Text ohne #-Praefix."""
-    return line.lstrip().lstrip("#").strip()
+    `| A | B |` → ['A', 'B']
+    `||A|B||` (User-Tippfehler mit empty edges) → ['A', 'B'] statt ['', 'A', 'B', '']
+    """
+    s = header_line.strip()
+    if not (s.startswith("|") and s.endswith("|")):
+        return []
+    cells = [c.strip() for c in s[1:-1].split("|")]
+    # Leading/trailing leere Cells abschneiden (Tippfehler-Tolerant)
+    while cells and not cells[0]:
+        cells.pop(0)
+    while cells and not cells[-1]:
+        cells.pop()
+    return cells
 
 
 def _find_table(lines: list[str], heading: str | None) -> tuple[int, int, int]:
-    """Findet eine Tabelle im body.
+    """Findet eine Tabelle im body. Code-Block-aware.
 
     Returns:
         (header_idx, sep_idx, n_cols) — Indizes in `lines`, Spaltenzahl.
@@ -693,39 +688,35 @@ def _find_table(lines: list[str], heading: str | None) -> tuple[int, int, int]:
     Raises:
         ValueError mit klarer Message wenn keine/mehrere Tabellen.
     """
-    # 1) Search-Range bestimmen
+    # 1) Search-Range bestimmen via vault.find_heading_range (code-block-aware)
     if heading:
-        target = heading.strip().lower()
-        h_idx = -1
-        h_level = 0
-        for i, line in enumerate(lines):
-            lvl = _heading_level(line)
-            if lvl > 0 and target in _heading_text(line).lower():
-                h_idx = i
-                h_level = lvl
-                break
-        if h_idx < 0:
+        rng = vault.find_heading_range(lines, heading)
+        if rng is None:
             raise ValueError(f"Heading nicht gefunden: {heading!r}")
-        # Range: nach Heading bis zur naechsten Heading mit <= level
+        h_idx, end = rng
         start = h_idx + 1
-        end = len(lines)
-        for j in range(start, len(lines)):
-            lvl = _heading_level(lines[j])
-            if 0 < lvl <= h_level:
-                end = j
-                break
     else:
         start, end = 0, len(lines)
 
     # 2) Tabellen finden: Header-Zeile + direkt folgende Separator-Zeile
+    #    — innerhalb von ```fenced code blocks``` werden Pipes ignoriert,
+    #    sonst werden Tabellen-Beispiele in Doku-Notes faelschlich erkannt.
     tables: list[tuple[int, int]] = []
     i = start
+    in_code = False
     while i < end - 1:
+        if lines[i].strip().startswith("```"):
+            in_code = not in_code
+            i += 1
+            continue
+        if in_code:
+            i += 1
+            continue
         if _is_table_row(lines[i]) and _is_table_separator(lines[i + 1]):
             tables.append((i, i + 1))
-            # skip past data rows
+            # skip past data rows (auch hier code-block-aware)
             j = i + 2
-            while j < end and _is_table_row(lines[j]):
+            while j < end and not lines[j].strip().startswith("```") and _is_table_row(lines[j]):
                 j += 1
             i = j
         else:
@@ -741,8 +732,8 @@ def _find_table(lines: list[str], heading: str | None) -> tuple[int, int, int]:
         )
 
     header_idx, sep_idx = tables[0]
-    # Spaltenzahl aus Header
-    header_cells = [c for c in lines[header_idx].strip()[1:-1].split("|")]
+    # Spaltenzahl: empty edge-cells ignorieren (Tippfehler-tolerant)
+    header_cells = _split_header_cells(lines[header_idx])
     return header_idx, sep_idx, len(header_cells)
 
 
@@ -1024,8 +1015,27 @@ def create_meeting(
 # ---------- Two-Step Delete ---------------------------------------------------
 # Pending deletes leben in-memory: Server-Restart cancelt alle pending deletes
 # (gewollt — sicheres Default-Verhalten, kein versehentlicher Stale-Delete).
+#
+# TTL: 5 Minuten. Nach Ablauf wird der Token rejected. Beim Issue eines neuen
+# Tokens werden alle abgelaufenen Eintraege im Dict opportunistisch entfernt
+# (kein Memory-Leak bei Long-Running-Server). Hard-Cap bei 100 Eintraegen
+# (paranoid, aber waeren > 100 simultane pending-deletes ein klares Bug-Signal).
+
+PENDING_DELETE_TTL_SEC = 300
+PENDING_DELETE_MAX = 100
 
 _pending_deletes: dict[str, dict[str, Any]] = {}
+
+
+def _cleanup_expired_deletes() -> int:
+    """Loescht abgelaufene Eintraege aus _pending_deletes. Returns Anzahl gepurgt."""
+    import time
+    now = time.time()
+    expired = [t for t, p in _pending_deletes.items()
+               if p.get("expires_at_ts", 0) < now]
+    for t in expired:
+        _pending_deletes.pop(t, None)
+    return len(expired)
 
 
 @mcp.tool()
@@ -1033,12 +1043,14 @@ def request_delete(path: str, reason: str = "") -> dict[str, Any]:
     """Schritt 1 des Two-Step-Deletes: prüft ob Datei existiert und gibt
     einen Confirmation-Token zurück. Datei wird NOCH NICHT gelöscht.
 
+    Token laeuft nach 5 Minuten ab.
+
     Args:
         path: Rel-Pfad der zu löschenden Datei
         reason: Optionaler Grund (für Logging)
 
     Returns:
-        {confirm_token, path, preview, expires_in_seconds}
+        {confirm_token, path, preview, expires_in_seconds, ...}
         Token muss an confirm_delete übergeben werden um Löschung auszuführen.
     """
     try:
@@ -1051,13 +1063,24 @@ def request_delete(path: str, reason: str = "") -> dict[str, Any]:
             preview = full.read_text(encoding="utf-8")[:200].replace("\n", " ⏎ ")
         except OSError:
             preview = "(Binärdatei)"
-        # Token = Pfad-Hash + Timestamp (in-memory)
+
+        # Cleanup vor Issue (kostengünstig — typisch wenig pending-deletes)
+        _cleanup_expired_deletes()
+        if len(_pending_deletes) >= PENDING_DELETE_MAX:
+            raise ToolError(
+                f"Zu viele pending deletes ({len(_pending_deletes)} >= {PENDING_DELETE_MAX}). "
+                f"Bitte erst confirm_delete oder warten."
+            )
+
         import secrets
+        import time as _time
 
         token = secrets.token_urlsafe(8)
+        now = _time.time()
         _pending_deletes[token] = {
             "path": path,
             "requested_at": vault.now_iso(),
+            "expires_at_ts": now + PENDING_DELETE_TTL_SEC,
             "reason": reason,
         }
         return {
@@ -1066,6 +1089,7 @@ def request_delete(path: str, reason: str = "") -> dict[str, Any]:
             "size_bytes": size,
             "preview": preview,
             "reason": reason,
+            "expires_in_seconds": PENDING_DELETE_TTL_SEC,
             "next_step": f"confirm_delete(token='{token}') ausführen um zu löschen",
         }
     except VaultError as e:
@@ -1077,15 +1101,25 @@ def confirm_delete(token: str) -> dict[str, Any]:
     """Schritt 2 des Two-Step-Deletes: löscht die Datei für die der Token
     via request_delete erstellt wurde.
 
+    Token muss innerhalb 5 Minuten nach request_delete benutzt werden.
+
     Args:
         token: confirm_token aus request_delete
 
     Returns:
         {deleted: true, path, requested_at}  oder {error}
     """
+    import time as _time
+
     pending = _pending_deletes.pop(token, None)
     if not pending:
         raise ToolError(f"Token unbekannt oder abgelaufen: {token}")
+    # Expiry-Check (Defense in Depth — cleanup haette ihn schon raus, aber
+    # bei sehr knappem Timing kann er noch in _pending_deletes sein.)
+    if pending.get("expires_at_ts", 0) < _time.time():
+        raise ToolError(
+            f"Token abgelaufen (TTL {PENDING_DELETE_TTL_SEC}s). Bitte request_delete neu."
+        )
     try:
         # Snapshot vor Delete
         path = pending["path"]
@@ -1238,7 +1272,12 @@ def move(
             parent = parent.parent
 
         # Wikilink-Updates + FM related[] Updates in anderen Files
+        # TOCTOU-Schutz: vor dem Write nochmal mtime pruefen — wenn das File
+        # zwischen read und write extern modifiziert wurde, NICHT ueberschreiben
+        # (Datenverlust-Vermeidung). Der File wird als "skipped" gemeldet, der
+        # User kann dann gezielt nochmal move(update_links=True) ausfuehren.
         updated_files: list[dict[str, Any]] = []
+        skipped_files: list[dict[str, Any]] = []
         if old_id and new_id and old_id != new_id and update_links:
             # Vereinige: Files mit Body-Wikilinks + Files mit nur related[] FM
             all_paths_to_check = [p for p, _ in refs] + related_only_paths
@@ -1246,7 +1285,9 @@ def move(
                 # File evtl. = unsere neue Datei (selbstreferenz)? Skip wenn ja.
                 if path == dst:
                     continue
+                # Lese mit mtime-Snapshot (TOCTOU-Anker)
                 try:
+                    mtime_before = path.stat().st_mtime_ns
                     raw = path.read_text(encoding="utf-8").replace("\r\n", "\n")
                 except OSError:
                     continue
@@ -1262,6 +1303,25 @@ def move(
                 except Exception:  # noqa: BLE001
                     pass
                 if count > 0 or fm_changed:
+                    # TOCTOU-Check: mtime sich seit read geaendert?
+                    try:
+                        mtime_now = path.stat().st_mtime_ns
+                    except OSError:
+                        skipped_files.append({
+                            "path": vault.rel_path(path),
+                            "reason": "stat_failed_before_write",
+                        })
+                        continue
+                    if mtime_now != mtime_before:
+                        log.warning(
+                            "move: skip %s — concurrent modification (mtime changed %d → %d)",
+                            vault.rel_path(path), mtime_before, mtime_now,
+                        )
+                        skipped_files.append({
+                            "path": vault.rel_path(path),
+                            "reason": "concurrent_modification",
+                        })
+                        continue
                     path.write_text(new_raw, encoding="utf-8")
                     updated_files.append(
                         {
@@ -1271,7 +1331,7 @@ def move(
                         }
                     )
 
-        return {
+        result: dict[str, Any] = {
             "moved": True,
             "from": source,
             "to": dest,
@@ -1282,6 +1342,9 @@ def move(
             ),
             "wikilinks_updated": updated_files,
         }
+        if skipped_files:
+            result["wikilinks_skipped"] = skipped_files
+        return result
     except VaultError as e:
         raise ToolError(str(e))
 
@@ -3017,18 +3080,26 @@ def get_outline(path: str, include_tables: bool = False) -> dict[str, Any]:
     }
 
     if include_tables:
-        # Tabellen finden via existierender Helper aus append_table_row-Block
+        # Tabellen finden via _find_table-Helpers (code-block-aware seit P3.13)
         lines = body.split("\n")
         tables: list[dict[str, Any]] = []
         i = 0
+        in_code = False
         while i < len(lines) - 1:
+            if lines[i].strip().startswith("```"):
+                in_code = not in_code
+                i += 1
+                continue
+            if in_code:
+                i += 1
+                continue
             if _is_table_row(lines[i]) and _is_table_separator(lines[i + 1]):
-                cols_raw = lines[i].strip()[1:-1].split("|")
-                cols = [c.strip() for c in cols_raw]
+                # Empty-Edge-Cells abschneiden — Tippfehler-tolerant
+                cols = _split_header_cells(lines[i])
                 # Daten-Zeilen zaehlen
                 j = i + 2
                 n_data = 0
-                while j < len(lines) and _is_table_row(lines[j]):
+                while j < len(lines) and not lines[j].strip().startswith("```") and _is_table_row(lines[j]):
                     s = lines[j].strip()
                     cells = [c.strip() for c in s[1:-1].split("|")]
                     if not all(c == "" for c in cells):
@@ -3307,12 +3378,18 @@ def split_file(
     # Target schreiben
     import frontmatter as _fm
     target_post = _fm.Post("\n".join(section_lines).strip() + "\n")
+    new_stem = Path(new_path).stem
+    heading_title = lines[h_idx].lstrip("#").strip() or new_stem
     if copy_frontmatter:
         for k, v in source_post.metadata.items():
             target_post[k] = v
-        # ID auf new_path-stem aktualisieren
-        target_post["id"] = Path(new_path).stem
-        target_post["title"] = lines[h_idx].lstrip("#").strip() or Path(new_path).stem
+    # Pflicht-Felder (Schema §7) IMMER setzen — auch bei copy_frontmatter=False,
+    # sonst lint Schema-Drift. id ist neuer-Stem, title aus der Heading,
+    # type defaultet auf 'note' wenn nicht aus Source kopiert.
+    target_post["id"] = new_stem
+    target_post["title"] = heading_title
+    if "type" not in target_post.metadata:
+        target_post["type"] = "note"
     target_post["created"] = vault.today_iso()
     vault.write_post(new_path, target_post)
 
