@@ -83,6 +83,10 @@ _DEFAULT_ALLOWED_HOSTS = [
     "127.0.0.1",
     f"localhost:{MCP_PORT}",
     f"127.0.0.1:{MCP_PORT}",
+    # Container-Hostname fuer interne Docker-Calls (Bot/Dashboard auf default
+    # network erreichen MCP direkt unter ki-os-mcp:5002, ohne Caddy-Hairpin).
+    "ki-os-mcp",
+    f"ki-os-mcp:{MCP_PORT}",
 ]
 _DEFAULT_ALLOWED_ORIGINS = [
     "https://wiki-mcp.sima.business",
