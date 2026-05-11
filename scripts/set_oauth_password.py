@@ -1,7 +1,7 @@
 """Setup-Script: OAuth-Password setzen.
 
 Fragt das Passwort interaktiv ab (verlaesst nie die Console),
-generiert bcrypt-Hash und gibt eine Zeile aus die du in /opt/mcp/.env
+generiert bcrypt-Hash und gibt eine Zeile aus die du in /opt/KI_WIKI_MCP/.env
 einfuegst.
 
 Usage:
@@ -39,7 +39,7 @@ def main() -> int:
     hash_str = h.decode("ascii")
 
     print()
-    print("OK — fuege diese Zeile in /opt/mcp/.env ein:")
+    print("OK — fuege diese Zeile in /opt/KI_WIKI_MCP/.env ein:")
     print()
     print(f"OAUTH_PASSWORD_HASH={hash_str}")
     print()
@@ -51,7 +51,7 @@ def main() -> int:
         print(f"OAUTH_JWT_SECRET={jwt_secret}")
         print(f"OAUTH_USER_EMAIL={email}")
         print()
-    print("Danach: docker compose -f /opt/ki-os/docker-compose.yml restart mcp")
+    print("Danach: docker compose -f /opt/KI_WIKI_Stack/docker-compose.yml restart mcp")
     return 0
 
 

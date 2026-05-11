@@ -7,7 +7,7 @@ Stelle dann alle Clients auf den neuen Token um, dann löschst du
 MCP_TOKEN_LEGACY und restartest erneut.
 
 Verwendung am VPS:
-  cd /opt/mcp
+  cd /opt/KI_WIKI_MCP
   python3 scripts/rotate_token.py [--env-file .env]
 
 Output: alter Token als legacy gespeichert, neuer Token als MCP_TOKEN.
@@ -87,7 +87,7 @@ def main() -> int:
         print(f"✓ MCP_TOKEN_LEGACY entfernt aus {env_path}")
         print()
         print("Restart Container damit Legacy-Token nicht mehr akzeptiert wird:")
-        print("  cd /opt/ki-os && docker compose up -d --force-recreate mcp")
+        print("  cd /opt/KI_WIKI_Stack && docker compose up -d --force-recreate mcp")
         return 0
 
     if not current:
@@ -112,7 +112,7 @@ def main() -> int:
     print()
     print("Nächste Schritte:")
     print(f"  1. Container restarten:")
-    print(f"     cd /opt/ki-os && docker compose up -d --force-recreate mcp")
+    print(f"     cd /opt/KI_WIKI_Stack && docker compose up -d --force-recreate mcp")
     print(f"  2. Client-Configs updaten auf NEUEN Token")
     print(f"  3. Wenn alle Clients migriert: Legacy entfernen via:")
     print(f"     python3 {Path(__file__).name} --clear-legacy")

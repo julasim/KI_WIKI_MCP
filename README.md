@@ -88,13 +88,13 @@ Der Server läuft als 4. Container im
 ```bash
 ssh root@VPS
 cd /opt
-git clone https://github.com/julasim/KI_WIKI_MCP.git mcp
-cd /opt/mcp
+git clone https://github.com/julasim/KI_WIKI_MCP.git KI_WIKI_MCP
+cd /opt/KI_WIKI_MCP
 cp .env.example .env
 # MCP_TOKEN generieren + eintragen:
 python3 -c "import secrets; print(secrets.token_urlsafe(32))"
 
-cd /opt/ki-os && bash update.sh
+cd /opt/KI_WIKI_Stack && bash update.sh
 ```
 
 Caddy holt automatisch ein Let's-Encrypt-Zertifikat für die Domain
