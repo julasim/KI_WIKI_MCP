@@ -71,6 +71,24 @@ Jeder Tool-Call schreibt JSONL nach `/var/log/mcp/audit.log` (host: `/opt/mcp-lo
 - Healthcheck: `GET /health` → 200 (siehe `docker-compose.yml`)
 - Externe Verbindungen ausschließlich via Edge-Caddy (Reverse-Proxy in `/opt/Proxy/`)
 
+## Edge-Proxy / Public-Reachability
+
+Der MCP wird vom **edge-caddy** (Repo `julasim/Proxy`, deployed `/opt/Proxy/`) auf `wiki-mcp.sima.business` und Fallback `76-13-10-79.sslip.io` exponiert. Caddyfile-Block:
+
+```caddyfile
+wiki-mcp.sima.business {
+    reverse_proxy ki-os-mcp:5002 { flush_interval -1; header_up X-Real-IP {remote_host} }
+}
+```
+
+Der `ki-os-mcp`-Container hängt am externen Docker-Netz `proxy` (= das vom edge-caddy verwaltete Netz, geteilt mit anderen App-Stacks). Mehr zur Multi-Stack-Architektur in `/opt/Proxy/CLAUDE.md` oder im `Proxy`-Repo selbst.
+
+**Goldene Regeln (Verstoß = Stack-übergreifender 80/443-Konflikt):**
+- Kein eigener Caddy/Nginx mit `ports: "80:80"` im Compose
+- Container-Name `ki-os-mcp` nicht ändern — edge-caddy's Caddyfile referenziert per Name
+- Bei `MCP_ALLOWED_HOSTS`-Override: IMMER `ki-os-mcp` + `ki-os-mcp:5002` mit reinnehmen (sonst 421 von POSTs aus Bot/Dashboard)
+- Public-URL nur für externe Clients (Claude Desktop) — Bot/Dashboard erreichen MCP intern via `http://ki-os-mcp:5002/mcp/`
+
 ## Häufige Fallen
 
 - **421 Misdirected Request von POSTs** → MCP_ALLOWED_HOSTS Override hat Container-Hostnames vergessen
