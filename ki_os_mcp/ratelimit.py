@@ -72,6 +72,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         # Health-Endpoint nicht limitieren (Healthchecks)
         if request.url.path == "/health":
             return await call_next(request)
+        # OAuth-Discovery-Endpoints nicht limitieren — unauthenticated, idempotent,
+        # und Connector-Onboarding (z.B. Claude.ai) feuert mehrere parallel.
+        # Werden die abgewuergt bricht der OAuth-Flow noch vor User-Login ab.
+        if "/.well-known/" in request.url.path:
+            return await call_next(request)
         ip = self._client_ip(request)
         allowed, retry_after = self._take(ip)
         if not allowed:
