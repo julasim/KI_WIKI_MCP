@@ -91,12 +91,32 @@ def read_post(rel: str) -> frontmatter.Post:
     return frontmatter.loads(raw)
 
 
+_ISO_DATE_FM_RE = re.compile(
+    r"^(\s*[A-Za-z_][\w-]*:\s+)(\d{4}-\d{2}-\d{2})(\s*)$",
+    re.MULTILINE,
+)
+
+
+def force_quote_iso_dates(text: str) -> str:
+    """Force-quote nackte YYYY-MM-DD Frontmatter-Werte.
+
+    PyYAML quoted ISO-Date-Strings je nach Version inkonsistent. Konsumenten
+    wie js-yaml (Dashboard via gray-matter) parsen unquoted YYYY-MM-DD als
+    Date-Objekt — direkt in JSX gerendert crasht das React. Verhindern wir
+    quellseitig: alle nackten ISO-Dates kriegen Single-Quotes.
+
+    Idempotent: bereits gequotete Werte werden nicht doppelt umschlossen.
+    """
+    return _ISO_DATE_FM_RE.sub(r"\1'\2'\3", text)
+
+
 def write_post(rel: str, post: frontmatter.Post) -> None:
     """Schreibt Frontmatter+Body, setzt updated."""
     post["updated"] = today_iso()
     p = safe_path(rel)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+    raw = force_quote_iso_dates(frontmatter.dumps(post)) + "\n"
+    p.write_text(raw, encoding="utf-8")
 
 
 def delete_file(rel: str) -> None:

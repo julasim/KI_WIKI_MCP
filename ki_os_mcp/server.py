@@ -1643,6 +1643,20 @@ def create_project(
     if not slug or slug == "untitled":
         raise ToolError(f"Slug aus {name!r} nicht ableitbar — aussagekraeftigeren Namen waehlen")
 
+    # Tippfehler-Schutz: nahe-Duplikate gegen Top-Level-Slugs pruefen.
+    # Cutoff 0.85 catched piato-app vs patio-app ohne false-positives bei
+    # "app1" vs "app2". Subprojekt-Slugs ignorieren wir hier — die haben
+    # legitimerweise oft aehnliche Namen wie der Parent.
+    import difflib
+    projects_root = vault.VAULT_PATH / "05_Projects"
+    top_slugs = [d.name for d in projects_root.iterdir() if d.is_dir()] if projects_root.is_dir() else []
+    near = difflib.get_close_matches(slug, top_slugs, n=1, cutoff=0.85)
+    if near and near[0] != slug:
+        raise ToolError(
+            f"Slug {slug!r} ist sehr aehnlich zu existierendem Projekt "
+            f"{near[0]!r}. Tippfehler? Falls absichtlich, anderen Namen waehlen."
+        )
+
     # Existenz-Check rekursiv (verhindert Doppel-Slug an verschiedenen Orten)
     existing = _find_project_dir(slug)
     if existing is not None:
@@ -1655,8 +1669,7 @@ def create_project(
             "reason": f"Projekt existiert bereits: {rel}/",
         }
 
-    # Parent aufloesen falls Subprojekt
-    projects_root = vault.VAULT_PATH / "05_Projects"
+    # Parent aufloesen falls Subprojekt (projects_root oben schon zugewiesen)
     projects_root.mkdir(parents=True, exist_ok=True)
 
     if parent:
@@ -1716,8 +1729,8 @@ def create_project(
         "tags": list(tags or []),
     }
     post = frontmatter.Post(body, **fm)
-    readme_path = proj_dir / "README.md"
-    readme_path.write_text(frontmatter.dumps(post) + "\n", encoding="utf-8")
+    readme_rel = vault.rel_path(proj_dir / "README.md")
+    vault.write_post(readme_rel, post)
 
     # CONTEXT.md leeres Skeleton — befuellt via project_context() spaeter
     context_path = proj_dir / "CONTEXT.md"
