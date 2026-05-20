@@ -56,13 +56,25 @@ _SLUG_KEEP = re.compile(r"[^a-z0-9äöüß\-]+")
 
 def slugify(text: str) -> str:
     """Slug-Regel (übernommen aus Bot): kleinbuchstaben, Umlaute erhalten,
-    Spaces → `-`, sonst alles raus."""
+    Spaces → `-`, sonst alles raus.
+
+    Wird auf SLUG_MAX gekappt — lange Task-/Note-Titel ergeben sonst einen
+    Slug > Limit und werden vom Validator hart abgelehnt. Kappung bevorzugt
+    eine `-`-Grenze damit kein Wort mittendrin abgeschnitten wird.
+    """
     s = text.strip().lower()
     # NFC normalisieren damit ä/ö/ü als single codepoint bleiben
     s = unicodedata.normalize("NFC", s)
     s = s.replace(" ", "-")
     s = _SLUG_KEEP.sub("", s)
     s = re.sub(r"-+", "-", s).strip("-")
+    if len(s) > SLUG_MAX:
+        cut = s[:SLUG_MAX]
+        # An letzter `-`-Grenze trennen, falls vorhanden und nicht zu kurz
+        last_dash = cut.rfind("-")
+        if last_dash >= SLUG_MAX // 2:
+            cut = cut[:last_dash]
+        s = cut.strip("-")
     return s or "untitled"
 
 
